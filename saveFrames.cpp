@@ -52,11 +52,11 @@ public:
         int width  = (int)imgPtr->GetWidth();
         int height = (int)imgPtr->GetHeight();
 
-        void* pRGB = imgPtr->ConvertToRGB24(GX_BIT_0_7, GX_RAW2RGB_NEIGHBOUR, true);
+        void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
 
-        cv::Mat rgbMat(height, width, CV_8UC3, pRGB);
+        cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
         cv::Mat bgrMat;
-        cv::cvtColor(rgbMat, bgrMat, cv::COLOR_RGB2BGR);
+        cv::cvtColor(grayMat, bgrMat, cv::COLOR_GRAY2BGR);
         cv::flip(bgrMat, bgrMat, 0);
 
         int count = g_cameras[m_index].frameCount.fetch_add(1);
