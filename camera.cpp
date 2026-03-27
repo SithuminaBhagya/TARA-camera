@@ -28,23 +28,33 @@ public:
 
     void DoOnImageCaptured(CImageDataPointer& imgPtr, void* pUserParam) override
     {
-        if (imgPtr->GetStatus() != GX_FRAME_STATUS_SUCCESS)
-            return;
-
-        int width  = (int)imgPtr->GetWidth();
-        int height = (int)imgPtr->GetHeight();
-
-        void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
-
-        cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
-        cv::Mat bgrMat;
-        cv::cvtColor(grayMat, bgrMat, cv::COLOR_GRAY2BGR);
-        cv::flip(bgrMat, bgrMat, 0);
-
+        try
         {
-            std::lock_guard<std::mutex> lock(g_frames[m_index].mtx);
-            g_frames[m_index].frame = bgrMat.clone();
-            g_frames[m_index].hasNewFrame = true;
+            if (imgPtr->GetStatus() != GX_FRAME_STATUS_SUCCESS)
+                return;
+
+            int width  = (int)imgPtr->GetWidth();
+            int height = (int)imgPtr->GetHeight();
+
+            std::cout << "Cam " << m_index << " frame: " << width << "x" << height << std::endl;
+
+            void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
+            if (!pRaw8) { std::cout << "Cam " << m_index << " pRaw8 null" << std::endl; return; }
+
+            cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
+            cv::Mat bgrMat;
+            cv::cvtColor(grayMat, bgrMat, cv::COLOR_GRAY2BGR);
+            cv::flip(bgrMat, bgrMat, 0);
+
+            {
+                std::lock_guard<std::mutex> lock(g_frames[m_index].mtx);
+                g_frames[m_index].frame = bgrMat.clone();
+                g_frames[m_index].hasNewFrame = true;
+            }
+        }
+        catch (std::exception& e)
+        {
+            std::cout << "Callback error cam " << m_index << ": " << e.what() << std::endl;
         }
     }
 };
