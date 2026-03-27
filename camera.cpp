@@ -83,40 +83,34 @@ int main()
         std::vector<CGXFeatureControlPointer> featureControls(camCount);
         std::vector<std::shared_ptr<CCaptureHandler>> callbacks(camCount);
 
+        // Phase 1: Open and configure all cameras first
         for (int i = 0; i < camCount; ++i)
         {
-            // Open device
             cameras[i] = IGXFactory::GetInstance().OpenDeviceBySN(
                 vecDeviceInfo[i].GetSN(), GX_ACCESS_EXCLUSIVE
             );
 
-            // Get feature controller
             featureControls[i] = cameras[i]->GetRemoteFeatureControl();
 
-            // Set full resolution
             featureControls[i]->GetIntFeature("Width")->SetValue(2600);
             featureControls[i]->GetIntFeature("Height")->SetValue(2160);
             featureControls[i]->GetIntFeature("OffsetX")->SetValue(0);
             featureControls[i]->GetIntFeature("OffsetY")->SetValue(0);
 
-            // Set continuous acquisition mode
-            featureControls[i]->GetEnumFeature("AcquisitionMode")
-                               ->SetValue("Continuous");
+            featureControls[i]->GetEnumFeature("AcquisitionMode")->SetValue("Continuous");
 
-            // Open stream
             streams[i] = cameras[i]->OpenStream(0);
-            
-
-            // Register callback
             callbacks[i] = std::make_shared<CCaptureHandler>(i);
             streams[i]->RegisterCaptureCallback(callbacks[i].get(), nullptr);
 
-            // Start grabbing
+            std::cout << "Camera " << i << " configured." << std::endl;
+        }
+
+        // Phase 2: Start all cameras streaming together
+        for (int i = 0; i < camCount; ++i)
+        {
             streams[i]->StartGrab();
-
-            // Send AcquisitionStart command
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
-
             std::cout << "Camera " << i << " started." << std::endl;
         }
 

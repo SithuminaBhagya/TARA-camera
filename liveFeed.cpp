@@ -144,6 +144,7 @@ int main()
         std::vector<CGXFeatureControlPointer>         featureControls(4);
         std::vector<std::shared_ptr<CCaptureHandler>> callbacks(4);
 
+        // Phase 1: Open and configure all cameras first
         for (int i = 0; i < 4; ++i)
         {
             cameras[i] = IGXFactory::GetInstance().OpenDeviceBySN(
@@ -167,9 +168,15 @@ int main()
             streams[i] = cameras[i]->OpenStream(0);
             callbacks[i] = std::make_shared<CCaptureHandler>(i);
             streams[i]->RegisterCaptureCallback(callbacks[i].get(), nullptr);
+
+            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") configured." << std::endl;
+        }
+
+        // Phase 2: Start all cameras streaming together
+        for (int i = 0; i < 4; ++i)
+        {
             streams[i]->StartGrab();
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
-
             std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") started." << std::endl;
         }
 

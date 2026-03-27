@@ -140,6 +140,7 @@ int main()
         std::vector<CGXFeatureControlPointer>          featureControls(4);
         std::vector<std::shared_ptr<CCaptureHandler>>  callbacks(4);
 
+        // Phase 1: Open and configure all cameras first
         for (int i = 0; i < 4; ++i)
         {
             cameras[i] = IGXFactory::GetInstance().OpenDeviceBySN(
@@ -148,13 +149,11 @@ int main()
 
             featureControls[i] = cameras[i]->GetRemoteFeatureControl();
 
-            // Full resolution
             featureControls[i]->GetIntFeature("Width")->SetValue(2600);
             featureControls[i]->GetIntFeature("Height")->SetValue(2160);
             featureControls[i]->GetIntFeature("OffsetX")->SetValue(0);
             featureControls[i]->GetIntFeature("OffsetY")->SetValue(0);
 
-            // Maximum throughput, fixed frame rate for all cameras
             featureControls[i]->GetIntFeature("DeviceLinkThroughputLimit")->SetValue(400000000);
             featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
             featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(70.0);
@@ -165,14 +164,18 @@ int main()
             configureMaster(featureControls[i]);
 
             streams[i] = cameras[i]->OpenStream(0);
-
             callbacks[i] = std::make_shared<CCaptureHandler>(i);
             streams[i]->RegisterCaptureCallback(callbacks[i].get(), nullptr);
+
+            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") configured." << std::endl;
+        }
+
+        // Phase 2: Start all cameras streaming together
+        for (int i = 0; i < 4; ++i)
+        {
             streams[i]->StartGrab();
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
-
-            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") started ["
-                      << (i % 2 == 0 ? "master" : "slave") << "]" << std::endl;
+            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") started." << std::endl;
         }
 
         std::cout << "\nRecording... Press Q to stop.\n" << std::endl;
