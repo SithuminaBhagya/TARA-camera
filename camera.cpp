@@ -44,7 +44,6 @@ public:
             cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
             cv::Mat bgrMat;
             cv::cvtColor(grayMat, bgrMat, cv::COLOR_GRAY2BGR);
-            cv::flip(bgrMat, bgrMat, 0);
 
             {
                 std::lock_guard<std::mutex> lock(g_frames[m_index].mtx);
