@@ -13,7 +13,7 @@ namespace fs = std::filesystem;
 const std::string SAVE_ROOT  = "recordings";
 const int         DISPLAY_W  = 800;   // width of each camera cell
 const int         DISPLAY_H  = 667;   // height of each camera cell
-const int         FPS        = 30;    // playback FPS
+const int         FPS        = 70;    // playback FPS — match capture rate
 
 // ── Collect sorted frame paths for one camera folder ──────────────
 std::vector<std::string> getFramePaths(const std::string& camFolder)
