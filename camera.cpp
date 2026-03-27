@@ -117,6 +117,15 @@ int main()
         // Step 5: Display loop
         std::cout << "Press Q to quit." << std::endl;
 
+        // Pre-create windows so waitKey works immediately
+        for (int i = 0; i < camCount; ++i)
+        {
+            std::string winName = "Camera " + std::to_string(i)
+                                + " [" + std::string(vecDeviceInfo[i].GetSN()) + "]";
+            cv::namedWindow(winName, cv::WINDOW_NORMAL);
+            cv::resizeWindow(winName, 800, 667);
+        }
+
         while (true)
         {
             for (int i = 0; i < camCount; ++i)
