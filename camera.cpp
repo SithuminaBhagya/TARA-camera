@@ -142,10 +142,6 @@ int main()
             int key = cv::waitKey(1) & 0xFF;
             if (key == 'q' || key == 'Q' || key == 27)
                 break;
-            std::string win0 = "Camera 0 [" + std::string(vecDeviceInfo[0].GetSN()) + "]";
-            if (cv::getWindowProperty(win0, cv::WND_PROP_AUTOSIZE) >= 0 &&
-                cv::getWindowProperty(win0, cv::WND_PROP_VISIBLE) < 1)
-                break;
         }
 
         // Step 6: Clean shutdown
