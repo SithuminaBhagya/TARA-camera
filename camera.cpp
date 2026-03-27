@@ -151,9 +151,11 @@ int main()
 
                 if (!display.empty())
                 {
+                    cv::Mat resized;
+                    cv::resize(display, resized, { 800, 667 });
                     std::string winName = "Camera " + std::to_string(i)
                                        + " [" + std::string(vecDeviceInfo[i].GetSN()) + "]";
-                    cv::imshow(winName, display);
+                    cv::imshow(winName, resized);
                 }
             }
 
