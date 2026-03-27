@@ -154,9 +154,10 @@ int main()
             featureControls[i]->GetIntFeature("OffsetX")->SetValue(0);
             featureControls[i]->GetIntFeature("OffsetY")->SetValue(0);
 
-            // Maximum throughput and frame rate
+            // Maximum throughput, fixed frame rate for all cameras
             featureControls[i]->GetIntFeature("DeviceLinkThroughputLimit")->SetValue(400000000);
-            featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("Off");
+            featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
+            featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(70.0);
 
             featureControls[i]->GetEnumFeature("AcquisitionMode")->SetValue("Continuous");
 
