@@ -33,3 +33,9 @@ add_executable(Playback playback.cpp)
 target_link_libraries(Playback
     opencv_world4120
 )
+
+add_executable(LiveFeed liveFeed.cpp)
+target_link_libraries(LiveFeed
+    GxIAPICPPEx
+    opencv_world4120
+)
