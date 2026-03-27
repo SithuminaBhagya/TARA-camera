@@ -154,6 +154,10 @@ int main()
             featureControls[i]->GetIntFeature("OffsetX")->SetValue(0);
             featureControls[i]->GetIntFeature("OffsetY")->SetValue(0);
 
+            // Maximum throughput and frame rate
+            featureControls[i]->GetIntFeature("DeviceLinkThroughputLimit")->SetValue(400000000);
+            featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("Off");
+
             featureControls[i]->GetEnumFeature("AcquisitionMode")->SetValue("Continuous");
 
             // TODO: revert to master/slave once GPIO trigger cable is connected
