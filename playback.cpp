@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include <chrono>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -146,10 +148,12 @@ int main()
 
     int  frameIdx  = 0;
     bool paused    = false;
-    int  delay     = 1000 / FPS;
+    auto frameDuration = std::chrono::microseconds(1000000 / FPS);
 
     while (true)
     {
+        auto frameStart = std::chrono::steady_clock::now();
+
         if (!paused)
         {
             std::vector<cv::Mat> frames(4);
@@ -167,7 +171,7 @@ int main()
                 frameIdx = 0;  // loop
         }
 
-        int key = cv::waitKey(paused ? 30 : delay) & 0xFF;
+        int key = cv::waitKey(1) & 0xFF;
         if (key == 'q' || key == 'Q' || key == 27)
             break;
         if (key == ' ')
@@ -175,6 +179,12 @@ int main()
 
         if (cv::getWindowProperty("Playback", cv::WND_PROP_VISIBLE) < 1)
             break;
+
+        // Sleep for remaining frame time using high-resolution timer
+        auto elapsed = std::chrono::steady_clock::now() - frameStart;
+        auto sleepTime = frameDuration - elapsed;
+        if (sleepTime > std::chrono::microseconds(0))
+            std::this_thread::sleep_for(sleepTime);
     }
 
     cv::destroyAllWindows();
