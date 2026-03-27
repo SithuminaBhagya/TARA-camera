@@ -1,0 +1,8 @@
+build/
+recordings/
+.claude/
+*.exe
+*.obj
+*.pdb
+*.lib
+*.dll
