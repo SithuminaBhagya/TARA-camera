@@ -110,9 +110,11 @@ void configureMaster(CGXFeatureControlPointer& fc)
 
 void configureSlave(CGXFeatureControlPointer& fc)
 {
+    fc->GetEnumFeature("TriggerSelector")->SetValue("FrameStart");
     fc->GetEnumFeature("TriggerMode")->SetValue("On");
     fc->GetEnumFeature("TriggerSource")->SetValue("Line0");
     fc->GetEnumFeature("TriggerActivation")->SetValue("RisingEdge");
+    fc->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("Off");
 }
 
 // ── Main ──────────────────────────────────────────────────────────
