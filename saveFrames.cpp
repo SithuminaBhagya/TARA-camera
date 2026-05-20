@@ -1,6 +1,7 @@
 #include "GalaxyIncludes.h"
 #include <opencv2/opencv.hpp>
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <string>
 #include <atomic>
@@ -11,31 +12,28 @@
 
 namespace fs = std::filesystem;
 
-// ── Camera pairing config ─────────────────────────────────────────
-// Pair 1: index 0 = master, index 1 = slave
-// Pair 2: index 2 = master, index 3 = slave
+// index 0 = master (JCK26010021 / SN 10021), indices 1-3 = slaves
 const std::vector<std::string> CAM_SNS = {
-    "JCK26010020",  // pair 1 - master
-    "JCK26010019",  // pair 1 - slave
-    "JCK26010021",  // pair 2 - master
-    "JCK26010013"   // pair 2 - slave
+    "JCK26010021",  // 0 — master
+    "JCK26010020",  // 1 — slave
+    "JCK26010019",  // 2 — slave
+    "JCK26010013"   // 3 — slave
 };
 
 const std::string SAVE_ROOT = "recordings";
 
-// ── Per-camera state ──────────────────────────────────────────────
 struct CameraState
 {
     std::atomic<int> frameCount{ 0 };
     std::string savePath;
+    std::ofstream tsFile;
 
     CameraState() = default;
-    CameraState(CameraState&& other) noexcept
-        : frameCount(other.frameCount.load()),
-          savePath(std::move(other.savePath)) {}
+    CameraState(const CameraState&) = delete;
+    CameraState& operator=(const CameraState&) = delete;
 };
 
-std::vector<CameraState> g_cameras(4);
+CameraState g_cameras[4];
 
 // ── Callback ──────────────────────────────────────────────────────
 class CCaptureHandler : public ICaptureEventHandler
@@ -51,9 +49,9 @@ public:
 
         int width  = (int)imgPtr->GetWidth();
         int height = (int)imgPtr->GetHeight();
+        uint64_t ts = imgPtr->GetTimestamp();
 
         void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
-
         cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
         cv::Mat bgrMat;
         cv::cvtColor(grayMat, bgrMat, cv::COLOR_GRAY2BGR);
@@ -63,8 +61,10 @@ public:
         std::ostringstream ss;
         ss << g_cameras[m_index].savePath
            << "/frame_" << std::setw(6) << std::setfill('0') << count << ".jpg";
-
         cv::imwrite(ss.str(), bgrMat, { cv::IMWRITE_JPEG_QUALITY, 95 });
+
+        // one callback thread per camera — no concurrent writes to this file
+        g_cameras[m_index].tsFile << count << "," << ts << "\n";
     }
 };
 
@@ -82,26 +82,22 @@ std::string createExperimentFolder()
         expPath = ss.str();
     } while (fs::exists(expPath));
 
-    // pair_1/camera_0, pair_1/camera_1, pair_2/camera_2, pair_2/camera_3
-    for (int pair = 1; pair <= 2; ++pair)
+    for (int i = 0; i < 4; ++i)
     {
-        for (int cam = 0; cam < 2; ++cam)
-        {
-            int idx = (pair - 1) * 2 + cam;
-            std::string path = expPath + "/pair_" + std::to_string(pair)
-                             + "/camera_" + std::to_string(idx);
-            fs::create_directories(path);
-            g_cameras[idx].savePath = path;
-        }
+        std::string path = expPath + "/camera_" + std::to_string(i);
+        fs::create_directories(path);
+        g_cameras[i].savePath = path;
+        g_cameras[i].tsFile.open(path + "/timestamps.csv");
+        g_cameras[i].tsFile << "frame_index,timestamp_ticks\n";
     }
 
     return expPath;
 }
 
 // ── Trigger configuration ─────────────────────────────────────────
-// Master: free-runs and outputs a trigger pulse on Line1 when it exposes.
-// Slave : waits for a rising edge on Line0 before each capture.
-// NOTE  : verify Line1 (output) and Line0 (input) match your cable wiring.
+// Master: free-runs, outputs ExposureActive pulse on Line1.
+// Slave : waits for rising edge on Line0 before each capture.
+// Wiring: master Line1 (output) → slave Line0 (input) on all 3 slaves.
 
 void configureMaster(CGXFeatureControlPointer& fc)
 {
@@ -126,7 +122,6 @@ int main()
         IGXFactory::GetInstance().Init();
         std::cout << "SDK Initialized." << std::endl;
 
-        // Enumerate cameras first — required before OpenDeviceBySN
         GxIAPICPP::gxdeviceinfo_vector vecDeviceInfo;
         IGXFactory::GetInstance().UpdateDeviceList(1000, vecDeviceInfo);
         std::cout << "Found " << vecDeviceInfo.size() << " camera(s)." << std::endl;
@@ -139,7 +134,6 @@ int main()
         std::vector<CGXFeatureControlPointer>          featureControls(4);
         std::vector<std::shared_ptr<CCaptureHandler>>  callbacks(4);
 
-        // Phase 1: Open and configure all cameras first
         for (int i = 0; i < 4; ++i)
         {
             cameras[i] = IGXFactory::GetInstance().OpenDeviceBySN(
@@ -152,31 +146,36 @@ int main()
             featureControls[i]->GetIntFeature("Height")->SetValue(2160);
             featureControls[i]->GetIntFeature("OffsetX")->SetValue(0);
             featureControls[i]->GetIntFeature("OffsetY")->SetValue(0);
-
             featureControls[i]->GetIntFeature("DeviceLinkThroughputLimit")->SetValue(400000000);
-            featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
-            featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(70.0);
-
             featureControls[i]->GetEnumFeature("AcquisitionMode")->SetValue("Continuous");
 
-            // TODO: revert to master/slave once GPIO trigger cable is connected
-            configureMaster(featureControls[i]);
+            if (i == 0)
+                configureMaster(featureControls[i]);
+            else
+                configureSlave(featureControls[i]);
 
             streams[i] = cameras[i]->OpenStream(0);
             callbacks[i] = std::make_shared<CCaptureHandler>(i);
             streams[i]->RegisterCaptureCallback(callbacks[i].get(), nullptr);
 
-            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") configured." << std::endl;
+            std::string role = (i == 0) ? "master" : "slave";
+            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ", " << role << ") configured." << std::endl;
         }
 
-        // Phase 2: Start all cameras streaming together
+        // Phase 1: Arm all buffer queues
         for (int i = 0; i < 4; ++i)
-        {
             streams[i]->StartGrab();
+
+        // Phase 2: Start slaves first — they block waiting for trigger
+        for (int i = 1; i < 4; ++i)
+        {
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
-            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") started." << std::endl;
+            std::cout << "Slave " << i << " (" << CAM_SNS[i] << ") armed." << std::endl;
         }
 
+        // Phase 3: Start master last — it begins sending trigger pulses
+        featureControls[0]->GetCommandFeature("AcquisitionStart")->Execute();
+        std::cout << "Master (" << CAM_SNS[0] << ") started." << std::endl;
         std::cout << "\nRecording... Press Q to stop.\n" << std::endl;
 
         while (true)
@@ -190,24 +189,28 @@ int main()
             Sleep(10);
         }
 
-        // Shutdown
+        // Stop master first — no more trigger pulses
         std::cout << "\nShutting down..." << std::endl;
+        featureControls[0]->GetCommandFeature("AcquisitionStop")->Execute();
+        for (int i = 1; i < 4; ++i)
+            featureControls[i]->GetCommandFeature("AcquisitionStop")->Execute();
+
         for (int i = 0; i < 4; ++i)
         {
-            featureControls[i]->GetCommandFeature("AcquisitionStop")->Execute();
             streams[i]->StopGrab();
             streams[i]->UnregisterCaptureCallback();
             streams[i]->Close();
             cameras[i]->Close();
+            g_cameras[i].tsFile.close();
         }
 
-        cv::destroyAllWindows();
         IGXFactory::GetInstance().Uninit();
 
         std::cout << "\nFrames saved:" << std::endl;
         for (int i = 0; i < 4; ++i)
         {
-            std::cout << "  Camera " << i << " (" << CAM_SNS[i] << "): "
+            std::string role = (i == 0) ? "master" : "slave ";
+            std::cout << "  Cam " << i << " (" << role << " " << CAM_SNS[i] << "): "
                       << g_cameras[i].frameCount << " frames" << std::endl;
         }
         std::cout << "Saved to: " << expPath << std::endl;
