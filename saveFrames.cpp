@@ -48,7 +48,8 @@ struct CameraState
     // One continuous binary file — pure sequential writes, no per-frame open/close.
     // Format: raw 8-bit grayscale frames back-to-back, IMG_W × IMG_H bytes each.
     // Read frame N: seek to N × FRAME_BYTES, read FRAME_BYTES bytes.
-    std::ofstream framesFile;
+    // FILE_FLAG_WRITE_THROUGH bypasses OS write-back cache throttle on sustained writes.
+    HANDLE hFrames{ INVALID_HANDLE_VALUE };
 
     // Timestamps: saved_index (row 0,1,2...) maps to row in this CSV.
     // saved_index == position in framesFile (row 0 = first written frame, etc.)
@@ -93,15 +94,15 @@ void writerThreadFunc(int camIdx)
         }
 
         // Sequential write into the continuous frames file
-        cam.framesFile.write(
-            reinterpret_cast<const char*>(item.image.data), FRAME_BYTES);
+        DWORD written;
+        WriteFile(cam.hFrames, item.image.data, (DWORD)FRAME_BYTES, &written, nullptr);
 
         // Row number in CSV = position in binary file
         int savedIdx = cam.savedCount.fetch_add(1);
         cam.tsFile << savedIdx << "," << item.frameIndex << "," << item.timestamp << "\n";
     }
 
-    cam.framesFile.flush();
+    FlushFileBuffers(cam.hFrames);
     cam.tsFile.flush();
 }
 
@@ -160,7 +161,11 @@ std::string createExperimentFolder()
         fs::create_directories(path);
         g_cameras[i].savePath = path;
 
-        g_cameras[i].framesFile.open(path + "/frames.bin", std::ios::binary);
+        g_cameras[i].hFrames = CreateFileA(
+            (path + "/frames.bin").c_str(),
+            GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
 
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
         g_cameras[i].tsFile << "saved_index,frame_index,timestamp_ticks\n";
@@ -314,7 +319,7 @@ int main()
             std::ofstream meta(g_cameras[i].savePath + "/metadata.txt", std::ios::app);
             meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
 
-            g_cameras[i].framesFile.close();
+            CloseHandle(g_cameras[i].hFrames);
             g_cameras[i].tsFile.close();
         }
 
