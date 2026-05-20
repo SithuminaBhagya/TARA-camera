@@ -5,6 +5,10 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
@@ -12,21 +16,41 @@
 
 namespace fs = std::filesystem;
 
-// index 0 = master (JCK26010021 / SN 10021), indices 1-3 = slaves
+// index 0 = master (JCK26010021 / Camera 1), indices 1-3 = slaves
 const std::vector<std::string> CAM_SNS = {
-    "JCK26010021",  // 0 — master
-    "JCK26010020",  // 1 — slave
-    "JCK26010019",  // 2 — slave
-    "JCK26010013"   // 3 — slave
+    "JCK26010021",  // Camera 1 — master
+    "JCK26010020",  // Camera 2 — slave
+    "JCK26010019",  // Camera 3 — slave
+    "JCK26010013"   // Camera 4 — slave
 };
 
 const std::string SAVE_ROOT = "recordings";
 
+// ── Frame item passed from callback to writer thread ──────────────
+struct FrameItem
+{
+    cv::Mat  image;
+    int      frameIndex;
+    uint64_t timestamp;
+};
+
+// ── Per-camera state ──────────────────────────────────────────────
 struct CameraState
 {
-    std::atomic<int> frameCount{ 0 };
-    std::string savePath;
-    std::ofstream tsFile;
+    std::atomic<int>  frameCount{ 0 };    // frames received by callback
+    std::atomic<int>  droppedCount{ 0 };  // frames dropped (queue full)
+    std::string       savePath;
+    std::ofstream     tsFile;
+
+    std::queue<FrameItem>    writeQueue;
+    std::mutex               queueMtx;
+    std::condition_variable  queueCv;
+    std::atomic<bool>        stopWriter{ false };
+    std::thread              writerThread;
+
+    // 16 frames × 16.8 MB = ~268 MB per camera buffer.
+    // If "dropped > 0" in the final report, increase this or use faster storage.
+    static const int MAX_QUEUE_DEPTH = 16;
 
     CameraState() = default;
     CameraState(const CameraState&) = delete;
@@ -35,7 +59,41 @@ struct CameraState
 
 CameraState g_cameras[4];
 
-// ── Callback ──────────────────────────────────────────────────────
+// ── Writer thread — one per camera ───────────────────────────────
+// Runs independently of the SDK callback thread.
+// Drains the queue completely before exiting so no frames are lost on shutdown.
+void writerThreadFunc(int camIdx)
+{
+    auto& cam = g_cameras[camIdx];
+
+    while (true)
+    {
+        FrameItem item;
+        {
+            std::unique_lock<std::mutex> lock(cam.queueMtx);
+            cam.queueCv.wait(lock, [&]{
+                return !cam.writeQueue.empty() || cam.stopWriter.load();
+            });
+
+            if (cam.writeQueue.empty())
+                break; // stop requested and queue fully drained
+
+            item = std::move(cam.writeQueue.front());
+            cam.writeQueue.pop();
+        }
+
+        // Write JPEG
+        std::ostringstream ss;
+        ss << cam.savePath << "/frame_"
+           << std::setw(6) << std::setfill('0') << item.frameIndex << ".jpg";
+        cv::imwrite(ss.str(), item.image, { cv::IMWRITE_JPEG_QUALITY, 95 });
+
+        // Write timestamp
+        cam.tsFile << item.frameIndex << "," << item.timestamp << "\n";
+    }
+}
+
+// ── Callback — runs on SDK thread, must return fast ──────────────
 class CCaptureHandler : public ICaptureEventHandler
 {
 public:
@@ -47,24 +105,31 @@ public:
         if (imgPtr->GetStatus() != GX_FRAME_STATUS_SUCCESS)
             return;
 
-        int width  = (int)imgPtr->GetWidth();
-        int height = (int)imgPtr->GetHeight();
-        uint64_t ts = imgPtr->GetTimeStamp();
+        int width    = (int)imgPtr->GetWidth();
+        int height   = (int)imgPtr->GetHeight();
+        uint64_t ts  = imgPtr->GetTimeStamp();
 
         void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
         cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
         cv::Mat bgrMat;
         cv::cvtColor(grayMat, bgrMat, cv::COLOR_GRAY2BGR);
 
-        int count = g_cameras[m_index].frameCount.fetch_add(1);
+        auto& cam   = g_cameras[m_index];
+        int   count = cam.frameCount.fetch_add(1);
 
-        std::ostringstream ss;
-        ss << g_cameras[m_index].savePath
-           << "/frame_" << std::setw(6) << std::setfill('0') << count << ".jpg";
-        cv::imwrite(ss.str(), bgrMat, { cv::IMWRITE_JPEG_QUALITY, 95 });
-
-        // one callback thread per camera — no concurrent writes to this file
-        g_cameras[m_index].tsFile << count << "," << ts << "\n";
+        // Push to writer queue — never block here
+        {
+            std::lock_guard<std::mutex> lock(cam.queueMtx);
+            if ((int)cam.writeQueue.size() < CameraState::MAX_QUEUE_DEPTH)
+            {
+                cam.writeQueue.push({ bgrMat.clone(), count, ts });
+                cam.queueCv.notify_one();
+            }
+            else
+            {
+                cam.droppedCount.fetch_add(1);
+            }
+        }
     }
 };
 
@@ -82,7 +147,6 @@ std::string createExperimentFolder()
         expPath = ss.str();
     } while (fs::exists(expPath));
 
-    // camera_1..4 matching physical labelling (021=Cam1, 020=Cam2, 019=Cam3, 013=Cam4)
     for (int i = 0; i < 4; ++i)
     {
         std::string path = expPath + "/camera_" + std::to_string(i + 1);
@@ -96,10 +160,6 @@ std::string createExperimentFolder()
 }
 
 // ── Trigger configuration ─────────────────────────────────────────
-// Master: free-runs, outputs ExposureActive pulse on Line1.
-// Slave : waits for rising edge on Line0 before each capture.
-// Wiring: master Line1 (output) → slave Line0 (input) on all 3 slaves.
-
 void configureMaster(CGXFeatureControlPointer& fc)
 {
     fc->GetEnumFeature("TriggerMode")->SetValue("Off");
@@ -132,6 +192,10 @@ int main()
         std::string expPath = createExperimentFolder();
         std::cout << "Saving to: " << expPath << std::endl;
 
+        // Start writer threads before acquisition begins
+        for (int i = 0; i < 4; ++i)
+            g_cameras[i].writerThread = std::thread(writerThreadFunc, i);
+
         std::vector<CGXDevicePointer>                  cameras(4);
         std::vector<CGXStreamPointer>                  streams(4);
         std::vector<CGXFeatureControlPointer>          featureControls(4);
@@ -154,11 +218,8 @@ int main()
 
             if (i == 0)
             {
-                // Limit master frame rate so disk I/O keeps up with all 4 cameras.
-                // At 10fps each camera gets ~100ms to write one JPEG — enough headroom.
-                // Raise this once you confirm sync is working.
                 featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
-                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(10.0);
+                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(70.0);
                 configureMaster(featureControls[i]);
             }
             else
@@ -172,20 +233,20 @@ int main()
             std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i] << ", " << role << ") configured." << std::endl;
         }
 
-        // Phase 1: Arm all buffer queues
+        // Arm all buffer queues
         for (int i = 0; i < 4; ++i)
             streams[i]->StartGrab();
 
-        // Phase 2: Start slaves first — they block waiting for trigger
+        // Start slaves first — they wait for trigger
         for (int i = 1; i < 4; ++i)
         {
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
             std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i] << ") armed." << std::endl;
         }
 
-        // Phase 3: Start master last — it begins sending trigger pulses
+        // Start master last — begins sending trigger pulses
         featureControls[0]->GetCommandFeature("AcquisitionStart")->Execute();
-        std::cout << "Master (" << CAM_SNS[0] << ") started." << std::endl;
+        std::cout << "Camera 1 (" << CAM_SNS[0] << ") started." << std::endl;
         std::cout << "\nRecording... Press Q to stop.\n" << std::endl;
 
         while (true)
@@ -196,11 +257,21 @@ int main()
                 if (c == 'q' || c == 'Q')
                     break;
             }
-            Sleep(10);
+
+            // Print live queue depths so you can see if disk is keeping up
+            std::cout << "\r  Queue: ";
+            for (int i = 0; i < 4; ++i)
+            {
+                std::lock_guard<std::mutex> lock(g_cameras[i].queueMtx);
+                std::cout << "Cam" << (i + 1) << "=" << g_cameras[i].writeQueue.size() << "  ";
+            }
+            std::cout << std::flush;
+
+            Sleep(500);
         }
 
         // Stop master first — no more trigger pulses
-        std::cout << "\nShutting down..." << std::endl;
+        std::cout << "\n\nStopping acquisition..." << std::endl;
         featureControls[0]->GetCommandFeature("AcquisitionStop")->Execute();
         for (int i = 1; i < 4; ++i)
             featureControls[i]->GetCommandFeature("AcquisitionStop")->Execute();
@@ -211,17 +282,34 @@ int main()
             streams[i]->UnregisterCaptureCallback();
             streams[i]->Close();
             cameras[i]->Close();
+        }
+
+        // Signal writer threads to finish draining then exit
+        std::cout << "Flushing write queues (waiting for disk)..." << std::endl;
+        for (int i = 0; i < 4; ++i)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_cameras[i].queueMtx);
+                g_cameras[i].stopWriter.store(true);
+                g_cameras[i].queueCv.notify_one();
+            }
+            g_cameras[i].writerThread.join();
             g_cameras[i].tsFile.close();
         }
 
         IGXFactory::GetInstance().Uninit();
 
-        std::cout << "\nFrames saved:" << std::endl;
+        std::cout << "\nResults:" << std::endl;
         for (int i = 0; i < 4; ++i)
         {
             std::string role = (i == 0) ? "master" : "slave ";
+            int captured = g_cameras[i].frameCount.load();
+            int dropped  = g_cameras[i].droppedCount.load();
             std::cout << "  Camera " << (i + 1) << " (" << role << " " << CAM_SNS[i] << "): "
-                      << g_cameras[i].frameCount << " frames" << std::endl;
+                      << captured << " captured";
+            if (dropped > 0)
+                std::cout << ",  " << dropped << " DROPPED (queue full — disk too slow)";
+            std::cout << std::endl;
         }
         std::cout << "Saved to: " << expPath << std::endl;
     }
