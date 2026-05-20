@@ -24,36 +24,39 @@ const std::vector<std::string> CAM_SNS = {
     "JCK26010013"   // Camera 4 — slave
 };
 
-const std::string SAVE_ROOT = "recordings";
-const int         IMG_W     = 2600;
-const int         IMG_H     = 2160;
-const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H; // 8-bit mono, 1 byte/pixel
+const std::string SAVE_ROOT  = "recordings";
+const int         IMG_W      = 2600;
+const int         IMG_H      = 2160;
+const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 
 // ── Frame item passed from callback to writer thread ──────────────
 struct FrameItem
 {
-    cv::Mat  image;       // CV_8UC1 grayscale
-    int      frameIndex;  // callback-assigned index (may have gaps if dropped)
+    int      matIdx;      // index into CameraState::matPool
+    int      frameIndex;
     uint64_t timestamp;
 };
 
 // ── Per-camera state ──────────────────────────────────────────────
 struct CameraState
 {
-    std::atomic<int>  frameCount{ 0 };    // total frames received by callback
-    std::atomic<int>  savedCount{ 0 };    // frames actually written to disk
-    std::atomic<int>  droppedCount{ 0 };  // frames dropped (queue full)
+    std::atomic<int>  frameCount{ 0 };
+    std::atomic<int>  savedCount{ 0 };
+    std::atomic<int>  droppedCount{ 0 };
     std::string       savePath;
 
     // One continuous binary file — pure sequential writes, no per-frame open/close.
     // Format: raw 8-bit grayscale frames back-to-back, IMG_W × IMG_H bytes each.
     // Read frame N: seek to N × FRAME_BYTES, read FRAME_BYTES bytes.
-    // FILE_FLAG_WRITE_THROUGH bypasses OS write-back cache throttle on sustained writes.
     HANDLE hFrames{ INVALID_HANDLE_VALUE };
 
-    // Timestamps: saved_index (row 0,1,2...) maps to row in this CSV.
-    // saved_index == position in framesFile (row 0 = first written frame, etc.)
     std::ofstream tsFile;
+
+    // Pre-allocated frame buffer pool.
+    // freeMats holds indices of buffers not currently in writeQueue.
+    // Eliminates per-frame VirtualAlloc/Free that was bottlenecking throughput.
+    std::vector<cv::Mat> matPool;
+    std::vector<int>     freeMats;
 
     std::queue<FrameItem>    writeQueue;
     std::mutex               queueMtx;
@@ -62,7 +65,6 @@ struct CameraState
     std::thread              writerThread;
 
     // 48 frames × 5.6 MB = ~268 MB per camera.
-    // 3× deeper than before at same RAM cost (was 16 × 16.8 MB).
     static const int MAX_QUEUE_DEPTH = 48;
 
     CameraState() = default;
@@ -76,12 +78,19 @@ CameraState g_cameras[4];
 void writerThreadFunc(int camIdx)
 {
     auto& cam = g_cameras[camIdx];
+    int lastMatIdx = -1;
 
     while (true)
     {
         FrameItem item;
         {
             std::unique_lock<std::mutex> lock(cam.queueMtx);
+            // Return the buffer from the previous write back to the free pool
+            if (lastMatIdx >= 0)
+            {
+                cam.freeMats.push_back(lastMatIdx);
+                lastMatIdx = -1;
+            }
             cam.queueCv.wait(lock, [&]{
                 return !cam.writeQueue.empty() || cam.stopWriter.load();
             });
@@ -89,17 +98,27 @@ void writerThreadFunc(int camIdx)
             if (cam.writeQueue.empty())
                 break; // stop requested, queue fully drained
 
-            item = std::move(cam.writeQueue.front());
+            item = cam.writeQueue.front();
             cam.writeQueue.pop();
         }
 
         // Sequential write into the continuous frames file
         DWORD written;
-        WriteFile(cam.hFrames, item.image.data, (DWORD)FRAME_BYTES, &written, nullptr);
+        WriteFile(cam.hFrames,
+                  cam.matPool[item.matIdx].data,
+                  (DWORD)FRAME_BYTES, &written, nullptr);
 
-        // Row number in CSV = position in binary file
         int savedIdx = cam.savedCount.fetch_add(1);
         cam.tsFile << savedIdx << "," << item.frameIndex << "," << item.timestamp << "\n";
+
+        lastMatIdx = item.matIdx; // will be returned to pool at top of next iteration
+    }
+
+    // Return the last buffer if we exited before the next iteration returned it
+    if (lastMatIdx >= 0)
+    {
+        std::lock_guard<std::mutex> lock(cam.queueMtx);
+        cam.freeMats.push_back(lastMatIdx);
     }
 
     FlushFileBuffers(cam.hFrames);
@@ -118,19 +137,20 @@ public:
         if (imgPtr->GetStatus() != GX_FRAME_STATUS_SUCCESS)
             return;
 
-        uint64_t ts = imgPtr->GetTimeStamp();
-
-        void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
-        cv::Mat grayMat(IMG_H, IMG_W, CV_8UC1, pRaw8);
+        uint64_t ts   = imgPtr->GetTimeStamp();
+        void*    pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
 
         auto& cam   = g_cameras[m_index];
         int   count = cam.frameCount.fetch_add(1);
 
         {
             std::lock_guard<std::mutex> lock(cam.queueMtx);
-            if ((int)cam.writeQueue.size() < CameraState::MAX_QUEUE_DEPTH)
+            if (!cam.freeMats.empty())
             {
-                cam.writeQueue.push({ grayMat.clone(), count, ts });
+                int idx = cam.freeMats.back();
+                cam.freeMats.pop_back();
+                memcpy(cam.matPool[idx].data, pRaw8, FRAME_BYTES);
+                cam.writeQueue.push({ idx, count, ts });
                 cam.queueCv.notify_one();
             }
             else
@@ -164,11 +184,19 @@ std::string createExperimentFolder()
         g_cameras[i].hFrames = CreateFileA(
             (path + "/frames.bin").c_str(),
             GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
 
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
         g_cameras[i].tsFile << "saved_index,frame_index,timestamp_ticks\n";
+
+        // Pre-allocate frame buffer pool
+        g_cameras[i].matPool.reserve(CameraState::MAX_QUEUE_DEPTH);
+        for (int j = 0; j < CameraState::MAX_QUEUE_DEPTH; ++j)
+        {
+            g_cameras[i].matPool.push_back(cv::Mat(IMG_H, IMG_W, CV_8UC1));
+            g_cameras[i].freeMats.push_back(j);
+        }
 
         // Metadata file for DIC software and playback
         std::ofstream meta(path + "/metadata.txt");
