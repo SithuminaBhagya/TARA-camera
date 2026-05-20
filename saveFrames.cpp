@@ -49,7 +49,7 @@ public:
 
         int width  = (int)imgPtr->GetWidth();
         int height = (int)imgPtr->GetHeight();
-        uint64_t ts = imgPtr->GetTimestamp();
+        uint64_t ts = imgPtr->GetTimeStamp();
 
         void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
         cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
