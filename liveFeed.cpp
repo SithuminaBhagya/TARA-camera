@@ -9,15 +9,14 @@
 #include <sstream>
 #include <iomanip>
 
-// ── Camera SNs ────────────────────────────────────────────────────
+// index 0 = master (JCK26010021 / SN 10021), indices 1-3 = slaves
 const std::vector<std::string> CAM_SNS = {
-    "JCK26010020",  // pair 1 - camera 0
-    "JCK26010019",  // pair 1 - camera 1
-    "JCK26010021",  // pair 2 - camera 2
-    "JCK26010013"   // pair 2 - camera 3
+    "JCK26010021",  // 0 — master
+    "JCK26010020",  // 1 — slave
+    "JCK26010019",  // 2 — slave
+    "JCK26010013"   // 3 — slave
 };
 
-// ── Display config ────────────────────────────────────────────────
 const int DISPLAY_W = 800;
 const int DISPLAY_H = 667;
 
@@ -28,10 +27,9 @@ struct CameraState
     std::mutex mtx;
     bool hasNewFrame = false;
 
-    std::atomic<int>    frameCount{ 0 };
-    std::atomic<int>    fpsCount{ 0 };    // frames since last FPS update
-    std::atomic<double> fps{ 0.0 };
-    std::atomic<double> throughputMBs{ 0.0 };
+    std::atomic<int>      frameCount{ 0 };
+    std::atomic<int>      fpsCount{ 0 };
+    std::atomic<double>   fps{ 0.0 };
 
     CameraState() = default;
     CameraState(CameraState&& other) noexcept
@@ -39,8 +37,7 @@ struct CameraState
           hasNewFrame(other.hasNewFrame),
           frameCount(other.frameCount.load()),
           fpsCount(other.fpsCount.load()),
-          fps(other.fps.load()),
-          throughputMBs(other.throughputMBs.load()) {}
+          fps(other.fps.load()) {}
 };
 
 std::vector<CameraState> g_cameras(4);
@@ -61,7 +58,6 @@ public:
         int height = (int)imgPtr->GetHeight();
 
         void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
-
         cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
         cv::Mat bgrMat;
         cv::cvtColor(grayMat, bgrMat, cv::COLOR_GRAY2BGR);
@@ -71,15 +67,59 @@ public:
         cam.fpsCount.fetch_add(1);
 
         std::lock_guard<std::mutex> lock(cam.mtx);
-        cam.frame      = bgrMat.clone();
+        cam.frame       = bgrMat.clone();
         cam.hasNewFrame = true;
     }
 };
+
+// ── Trigger configuration ─────────────────────────────────────────
+void configureMaster(CGXFeatureControlPointer& fc)
+{
+    fc->GetEnumFeature("TriggerMode")->SetValue("Off");
+    fc->GetEnumFeature("LineSelector")->SetValue("Line1");
+    fc->GetEnumFeature("LineMode")->SetValue("Output");
+    fc->GetEnumFeature("LineSource")->SetValue("ExposureActive");
+}
+
+void configureSlave(CGXFeatureControlPointer& fc)
+{
+    fc->GetEnumFeature("TriggerMode")->SetValue("On");
+    fc->GetEnumFeature("TriggerSource")->SetValue("Line0");
+    fc->GetEnumFeature("TriggerActivation")->SetValue("RisingEdge");
+}
+
+// ── Sync status helpers ───────────────────────────────────────────
+// delta = slave frameCount - master frameCount
+// In hardware sync this stays near 0. If circuit is broken, slaves
+// get no trigger and delta grows negatively without bound.
+struct SyncStatus { cv::Scalar border; std::string text; cv::Scalar textColor; };
+
+SyncStatus evalSync(int camIndex)
+{
+    if (camIndex == 0)
+        return { { 0, 200, 0 }, "MASTER", { 0, 255, 0 } };
+
+    double slaveFPS = g_cameras[camIndex].fps.load();
+    int delta = g_cameras[camIndex].frameCount.load()
+              - g_cameras[0].frameCount.load();
+
+    if (slaveFPS < 1.0)
+        return { { 0, 0, 220 }, "NO TRIGGER  check wiring", { 0, 80, 255 } };
+
+    int absDelta = std::abs(delta);
+    if (absDelta <= 3)
+        return { { 0, 200, 0 }, "SYNC OK", { 0, 255, 0 } };
+    if (absDelta <= 15)
+        return { { 0, 165, 255 }, "MINOR DRIFT  d=" + std::to_string(delta), { 0, 165, 255 } };
+
+    return { { 0, 0, 220 }, "SYNC FAIL  d=" + std::to_string(delta), { 0, 80, 255 } };
+}
 
 // ── Build 2x2 grid ────────────────────────────────────────────────
 cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
 {
     std::vector<cv::Mat> cells(4);
+    int masterCount = g_cameras[0].frameCount.load();
 
     for (int i = 0; i < 4; ++i)
     {
@@ -89,32 +129,45 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
         else
             cv::resize(frames[i], cell, { DISPLAY_W, DISPLAY_H });
 
-        // Pair and camera label
-        int pair = (i / 2) + 1;
-        std::string label = "Pair " + std::to_string(pair)
-                          + "  Cam " + std::to_string(i)
-                          + "  [" + CAM_SNS[i] + "]";
-        cv::putText(cell, label, { 10, 30 },
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, { 0, 255, 0 }, 2);
+        auto sync = evalSync(i);
 
-        // FPS
+        // Colored border shows sync health at a glance
+        cv::rectangle(cell, { 0, 0 }, { DISPLAY_W - 1, DISPLAY_H - 1 }, sync.border, 8);
+
+        // Camera label
+        std::string role  = (i == 0) ? "MASTER" : "SLAVE";
+        std::string label = "Cam " + std::to_string(i) + "  " + role
+                          + "  [" + CAM_SNS[i].substr(8) + "]"; // show last digits of SN
+        cv::putText(cell, label, { 14, 35 },
+                    cv::FONT_HERSHEY_SIMPLEX, 0.75, { 0, 255, 0 }, 2);
+
+        // FPS — red if near zero (no trigger arriving)
+        double fps = g_cameras[i].fps.load();
+        cv::Scalar fpsColor = (fps < 1.0) ? cv::Scalar(0, 80, 255) : cv::Scalar(0, 255, 255);
         std::ostringstream fpsSS;
-        fpsSS << std::fixed << std::setprecision(1)
-              << "FPS: " << g_cameras[i].fps.load();
-        cv::putText(cell, fpsSS.str(), { 10, 65 },
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, { 0, 255, 255 }, 2);
+        fpsSS << std::fixed << std::setprecision(1) << "FPS: " << fps;
+        cv::putText(cell, fpsSS.str(), { 14, 72 },
+                    cv::FONT_HERSHEY_SIMPLEX, 0.75, fpsColor, 2);
 
-        // Throughput
-        std::ostringstream tpSS;
-        tpSS << std::fixed << std::setprecision(1)
-             << "Throughput: " << g_cameras[i].throughputMBs.load() << " MB/s";
-        cv::putText(cell, tpSS.str(), { 10, 100 },
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, { 0, 200, 255 }, 2);
+        // Sync status text
+        cv::putText(cell, sync.text, { 14, 109 },
+                    cv::FONT_HERSHEY_SIMPLEX, 0.75, sync.textColor, 2);
 
-        // Total frames
-        std::string frameSS = "Frames: " + std::to_string(g_cameras[i].frameCount.load());
-        cv::putText(cell, frameSS, { 10, DISPLAY_H - 10 },
-                    cv::FONT_HERSHEY_SIMPLEX, 0.6, { 200, 200, 200 }, 1);
+        // Delta frame count (slaves only)
+        if (i > 0)
+        {
+            int delta = g_cameras[i].frameCount.load() - masterCount;
+            std::string dStr = "Delta frames: " + (delta >= 0 ? std::string("+") : "") + std::to_string(delta);
+            cv::Scalar dColor = (std::abs(delta) <= 3) ? cv::Scalar(200, 200, 200)
+                                                       : cv::Scalar(0, 80, 255);
+            cv::putText(cell, dStr, { 14, 146 },
+                        cv::FONT_HERSHEY_SIMPLEX, 0.65, dColor, 2);
+        }
+
+        // Total frames (bottom)
+        std::string frameSS = "Total: " + std::to_string(g_cameras[i].frameCount.load());
+        cv::putText(cell, frameSS, { 14, DISPLAY_H - 12 },
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, { 180, 180, 180 }, 1);
 
         cells[i] = cell;
     }
@@ -143,7 +196,6 @@ int main()
         std::vector<CGXFeatureControlPointer>         featureControls(4);
         std::vector<std::shared_ptr<CCaptureHandler>> callbacks(4);
 
-        // Phase 1: Open and configure all cameras first
         for (int i = 0; i < 4; ++i)
         {
             cameras[i] = IGXFactory::GetInstance().OpenDeviceBySN(
@@ -156,56 +208,62 @@ int main()
             featureControls[i]->GetIntFeature("Height")->SetValue(2160);
             featureControls[i]->GetIntFeature("OffsetX")->SetValue(0);
             featureControls[i]->GetIntFeature("OffsetY")->SetValue(0);
-
             featureControls[i]->GetIntFeature("DeviceLinkThroughputLimit")->SetValue(400000000);
-            featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
-            featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(70.0);
-
             featureControls[i]->GetEnumFeature("AcquisitionMode")->SetValue("Continuous");
-            featureControls[i]->GetEnumFeature("TriggerMode")->SetValue("Off");
+
+            if (i == 0)
+                configureMaster(featureControls[i]);
+            else
+                configureSlave(featureControls[i]);
 
             streams[i] = cameras[i]->OpenStream(0);
             callbacks[i] = std::make_shared<CCaptureHandler>(i);
             streams[i]->RegisterCaptureCallback(callbacks[i].get(), nullptr);
 
-            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") configured." << std::endl;
+            std::string role = (i == 0) ? "master" : "slave";
+            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ", " << role << ") configured." << std::endl;
         }
 
-        // Phase 2: Start all cameras streaming together
+        // Arm all buffer queues first
         for (int i = 0; i < 4; ++i)
-        {
             streams[i]->StartGrab();
+
+        // Start slaves first — they block waiting for the trigger signal
+        for (int i = 1; i < 4; ++i)
+        {
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
-            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ") started." << std::endl;
+            std::cout << "Slave " << i << " (" << CAM_SNS[i] << ") armed." << std::endl;
         }
 
-        std::cout << "Press Q or close window to quit." << std::endl;
+        // Start master last — begins sending trigger pulses
+        featureControls[0]->GetCommandFeature("AcquisitionStart")->Execute();
+        std::cout << "Master (" << CAM_SNS[0] << ") started.\n" << std::endl;
 
-        cv::namedWindow("Live Feed", cv::WINDOW_NORMAL);
-        cv::resizeWindow("Live Feed", DISPLAY_W * 2, DISPLAY_H * 2);
+        std::cout << "== Circuit check ==" << std::endl;
+        std::cout << "  Green border  + SYNC OK     -> trigger working, cameras in sync" << std::endl;
+        std::cout << "  Blue  border  + NO TRIGGER  -> circuit broken, check wiring" << std::endl;
+        std::cout << "  Orange border + MINOR DRIFT -> transient, watch if it grows" << std::endl;
+        std::cout << "Press Q or close window to quit.\n" << std::endl;
 
-        // FPS/throughput update timer
+        cv::namedWindow("Live Feed  |  Sync Test", cv::WINDOW_NORMAL);
+        cv::resizeWindow("Live Feed  |  Sync Test", DISPLAY_W * 2, DISPLAY_H * 2);
+
         auto lastFPSUpdate = std::chrono::steady_clock::now();
-        const double frameBytes = 2600.0 * 2160.0 * 1.0; // 8-bit mono
 
         while (true)
         {
-            // Update FPS and throughput every second
-            auto now = std::chrono::steady_clock::now();
+            auto now     = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - lastFPSUpdate).count();
             if (elapsed >= 1.0)
             {
                 for (int i = 0; i < 4; ++i)
                 {
                     int count = g_cameras[i].fpsCount.exchange(0);
-                    double fps = count / elapsed;
-                    g_cameras[i].fps.store(fps);
-                    g_cameras[i].throughputMBs.store((fps * frameBytes) / (1024.0 * 1024.0));
+                    g_cameras[i].fps.store(count / elapsed);
                 }
                 lastFPSUpdate = now;
             }
 
-            // Grab latest frames
             std::vector<cv::Mat> frames(4);
             for (int i = 0; i < 4; ++i)
             {
@@ -218,20 +276,22 @@ int main()
             }
 
             cv::Mat grid = buildGrid(frames);
-            cv::imshow("Live Feed", grid);
+            cv::imshow("Live Feed  |  Sync Test", grid);
 
             int key = cv::waitKey(1) & 0xFF;
             if (key == 'q' || key == 'Q' || key == 27)
                 break;
-            if (cv::getWindowProperty("Live Feed", cv::WND_PROP_VISIBLE) < 1)
+            if (cv::getWindowProperty("Live Feed  |  Sync Test", cv::WND_PROP_VISIBLE) < 1)
                 break;
         }
 
-        // Shutdown
-        std::cout << "Shutting down..." << std::endl;
+        // Stop master first, then slaves
+        featureControls[0]->GetCommandFeature("AcquisitionStop")->Execute();
+        for (int i = 1; i < 4; ++i)
+            featureControls[i]->GetCommandFeature("AcquisitionStop")->Execute();
+
         for (int i = 0; i < 4; ++i)
         {
-            featureControls[i]->GetCommandFeature("AcquisitionStop")->Execute();
             streams[i]->StopGrab();
             streams[i]->UnregisterCaptureCallback();
             streams[i]->Close();
@@ -249,7 +309,7 @@ int main()
     }
     catch (std::exception& e)
     {
-        std::cout << "Error: " << e.what() << std::endl;
+        std::cout << "General error: " << e.what() << std::endl;
         return -1;
     }
 
