@@ -30,6 +30,22 @@ const std::vector<std::string> CAM_LABELS = {
     "Cam 4  P2  slave  10013"
 };
 
+// ── Read frame stride from metadata.txt (falls back to FRAME_BYTES for old recordings) ──
+size_t getFrameStride(const std::string& camFolder)
+{
+    std::ifstream meta(camFolder + "/metadata.txt");
+    if (meta.is_open())
+    {
+        std::string line;
+        while (std::getline(meta, line))
+        {
+            if (line.substr(0, 13) == "frame_stride=")
+                return std::stoull(line.substr(13));
+        }
+    }
+    return FRAME_BYTES; // old experiments had no padding
+}
+
 // ── Read frame count from metadata.txt ───────────────────────────
 int getFrameCount(const std::string& camFolder)
 {
@@ -56,12 +72,12 @@ int getFrameCount(const std::string& camFolder)
 }
 
 // ── Load a single frame from frames.bin by index ─────────────────
-cv::Mat loadFrame(const std::string& camFolder, int frameIdx)
+cv::Mat loadFrame(const std::string& camFolder, int frameIdx, size_t stride)
 {
     std::ifstream f(camFolder + "/frames.bin", std::ios::binary);
     if (!f.is_open()) return {};
 
-    f.seekg((std::streamoff)frameIdx * (std::streamoff)FRAME_BYTES);
+    f.seekg((std::streamoff)frameIdx * (std::streamoff)stride);
     if (!f) return {};
 
     cv::Mat gray(IMG_H, IMG_W, CV_8UC1);
@@ -237,11 +253,13 @@ int main()
 
     std::vector<std::vector<uint64_t>> allTimestamps(4);
     std::vector<int>                   frameCounts(4, 0);
+    std::vector<size_t>                frameStrides(4, FRAME_BYTES);
     int maxFrames = 0;
 
     for (int i = 0; i < 4; ++i)
     {
         frameCounts[i]   = getFrameCount(camFolders[i]);
+        frameStrides[i]  = getFrameStride(camFolders[i]);
         allTimestamps[i] = loadTimestamps(camFolders[i]);
         maxFrames        = std::max(maxFrames, frameCounts[i]);
         std::cout << "Camera " << (i + 1) << ": " << frameCounts[i] << " frames  "
@@ -275,7 +293,7 @@ int main()
             for (int i = 0; i < 4; ++i)
             {
                 if (frameIdx < frameCounts[i])
-                    frames[i] = loadFrame(camFolders[i], frameIdx);
+                    frames[i] = loadFrame(camFolders[i], frameIdx, frameStrides[i]);
             }
 
             cv::Mat grid = buildGrid(frames, frameIdx, maxFrames);

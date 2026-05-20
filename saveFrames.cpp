@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <conio.h>
+#include <malloc.h>
 
 namespace fs = std::filesystem;
 
@@ -29,10 +30,16 @@ const int         IMG_W      = 2600;
 const int         IMG_H      = 2160;
 const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 
+// FILE_FLAG_NO_BUFFERING requires writes to be a multiple of the sector size (4096).
+// Pad FRAME_BYTES up to the next 4096-byte boundary.
+// Playback seeks by FRAME_STRIDE but reads only FRAME_BYTES valid pixels.
+const size_t SECTOR        = 4096;
+const size_t FRAME_STRIDE  = (FRAME_BYTES + SECTOR - 1) / SECTOR * SECTOR; // 5,619,712
+
 // ── Frame item passed from callback to writer thread ──────────────
 struct FrameItem
 {
-    int      matIdx;      // index into CameraState::matPool
+    int      bufIdx;      // index into CameraState::bufs / matPool
     int      frameIndex;
     uint64_t timestamp;
 };
@@ -45,18 +52,20 @@ struct CameraState
     std::atomic<int>  droppedCount{ 0 };
     std::string       savePath;
 
-    // One continuous binary file — pure sequential writes, no per-frame open/close.
-    // Format: raw 8-bit grayscale frames back-to-back, IMG_W × IMG_H bytes each.
-    // Read frame N: seek to N × FRAME_BYTES, read FRAME_BYTES bytes.
+    // FILE_FLAG_NO_BUFFERING: bypasses OS write-back cache, eliminating
+    // dirty-page throttle stalls (which caused 30-second WriteFile pauses).
+    // Requires 4096-aligned buffers and write sizes that are multiples of 4096.
     HANDLE hFrames{ INVALID_HANDLE_VALUE };
 
     std::ofstream tsFile;
 
-    // Pre-allocated frame buffer pool.
-    // freeMats holds indices of buffers not currently in writeQueue.
-    // Eliminates per-frame VirtualAlloc/Free that was bottlenecking throughput.
-    std::vector<cv::Mat> matPool;
-    std::vector<int>     freeMats;
+    // Pre-allocated, sector-aligned frame buffer pool.
+    // bufs[i]    — raw 4096-aligned pointer used for WriteFile and memcpy
+    // matPool[i] — cv::Mat header pointing into bufs[i] (does not own memory)
+    // freeBufs   — indices of buffers currently not in writeQueue
+    std::vector<uint8_t*> bufs;
+    std::vector<cv::Mat>  matPool;
+    std::vector<int>      freeBufs;
 
     std::queue<FrameItem>    writeQueue;
     std::mutex               queueMtx;
@@ -78,7 +87,7 @@ CameraState g_cameras[4];
 void writerThreadFunc(int camIdx)
 {
     auto& cam = g_cameras[camIdx];
-    int    lastMatIdx  = -1;
+    int    lastBufIdx   = -1;
     double totalWriteMs = 0.0;
     double maxWriteMs   = 0.0;
 
@@ -87,29 +96,26 @@ void writerThreadFunc(int camIdx)
         FrameItem item;
         {
             std::unique_lock<std::mutex> lock(cam.queueMtx);
-            // Return the buffer from the previous write back to the free pool
-            if (lastMatIdx >= 0)
+            if (lastBufIdx >= 0)
             {
-                cam.freeMats.push_back(lastMatIdx);
-                lastMatIdx = -1;
+                cam.freeBufs.push_back(lastBufIdx);
+                lastBufIdx = -1;
             }
             cam.queueCv.wait(lock, [&]{
                 return !cam.writeQueue.empty() || cam.stopWriter.load();
             });
 
             if (cam.writeQueue.empty())
-                break; // stop requested, queue fully drained
+                break;
 
             item = cam.writeQueue.front();
             cam.writeQueue.pop();
         }
 
-        // Sequential write into the continuous frames file
         DWORD written;
         auto  t0 = std::chrono::steady_clock::now();
-        WriteFile(cam.hFrames,
-                  cam.matPool[item.matIdx].data,
-                  (DWORD)FRAME_BYTES, &written, nullptr);
+        WriteFile(cam.hFrames, cam.bufs[item.bufIdx],
+                  (DWORD)FRAME_STRIDE, &written, nullptr);
         double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
         totalWriteMs += ms;
@@ -118,14 +124,13 @@ void writerThreadFunc(int camIdx)
         int savedIdx = cam.savedCount.fetch_add(1);
         cam.tsFile << savedIdx << "," << item.frameIndex << "," << item.timestamp << "\n";
 
-        lastMatIdx = item.matIdx; // will be returned to pool at top of next iteration
+        lastBufIdx = item.bufIdx;
     }
 
-    // Return the last buffer if we exited before the next iteration returned it
-    if (lastMatIdx >= 0)
+    if (lastBufIdx >= 0)
     {
         std::lock_guard<std::mutex> lock(cam.queueMtx);
-        cam.freeMats.push_back(lastMatIdx);
+        cam.freeBufs.push_back(lastBufIdx);
     }
 
     FlushFileBuffers(cam.hFrames);
@@ -135,7 +140,7 @@ void writerThreadFunc(int camIdx)
     if (saved > 0)
     {
         double avgMs = totalWriteMs / saved;
-        double mbps  = (FRAME_BYTES / 1024.0 / 1024.0) / (avgMs / 1000.0);
+        double mbps  = (FRAME_STRIDE / 1024.0 / 1024.0) / (avgMs / 1000.0);
         std::cout << "  Cam" << (camIdx + 1) << " write: avg " << std::fixed
                   << std::setprecision(2) << avgMs << " ms  max " << maxWriteMs
                   << " ms  (" << (int)mbps << " MB/s)" << std::endl;
@@ -154,7 +159,7 @@ public:
         if (imgPtr->GetStatus() != GX_FRAME_STATUS_SUCCESS)
             return;
 
-        uint64_t ts   = imgPtr->GetTimeStamp();
+        uint64_t ts    = imgPtr->GetTimeStamp();
         void*    pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
 
         auto& cam   = g_cameras[m_index];
@@ -162,11 +167,11 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(cam.queueMtx);
-            if (!cam.freeMats.empty())
+            if (!cam.freeBufs.empty())
             {
-                int idx = cam.freeMats.back();
-                cam.freeMats.pop_back();
-                memcpy(cam.matPool[idx].data, pRaw8, FRAME_BYTES);
+                int idx = cam.freeBufs.back();
+                cam.freeBufs.pop_back();
+                memcpy(cam.bufs[idx], pRaw8, FRAME_BYTES);
                 cam.writeQueue.push({ idx, count, ts });
                 cam.queueCv.notify_one();
             }
@@ -198,30 +203,38 @@ std::string createExperimentFolder()
         fs::create_directories(path);
         g_cameras[i].savePath = path;
 
+        // NO_BUFFERING: bypasses OS cache entirely — no dirty-page throttle stalls.
+        // SEQUENTIAL_SCAN: hints to OS prefetcher (has no effect with NO_BUFFERING,
+        // but harmless and useful if flags are ever changed).
         g_cameras[i].hFrames = CreateFileA(
             (path + "/frames.bin").c_str(),
             GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
 
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
         g_cameras[i].tsFile << "saved_index,frame_index,timestamp_ticks\n";
 
-        // Pre-allocate frame buffer pool
+        // Pre-allocate sector-aligned frame buffer pool
+        g_cameras[i].bufs.reserve(CameraState::MAX_QUEUE_DEPTH);
         g_cameras[i].matPool.reserve(CameraState::MAX_QUEUE_DEPTH);
         for (int j = 0; j < CameraState::MAX_QUEUE_DEPTH; ++j)
         {
-            g_cameras[i].matPool.push_back(cv::Mat(IMG_H, IMG_W, CV_8UC1));
-            g_cameras[i].freeMats.push_back(j);
+            auto* buf = static_cast<uint8_t*>(_aligned_malloc(FRAME_STRIDE, SECTOR));
+            memset(buf + FRAME_BYTES, 0, FRAME_STRIDE - FRAME_BYTES); // zero padding
+            g_cameras[i].bufs.push_back(buf);
+            g_cameras[i].matPool.push_back(cv::Mat(IMG_H, IMG_W, CV_8UC1, buf));
+            g_cameras[i].freeBufs.push_back(j);
         }
 
         // Metadata file for DIC software and playback
         std::ofstream meta(path + "/metadata.txt");
-        meta << "width="    << IMG_W    << "\n"
-             << "height="   << IMG_H    << "\n"
+        meta << "width="        << IMG_W        << "\n"
+             << "height="       << IMG_H        << "\n"
              << "channels=1\n"
              << "dtype=uint8\n"
-             << "byte_order=little_endian\n";
+             << "byte_order=little_endian\n"
+             << "frame_stride=" << FRAME_STRIDE << "\n";
     }
 
     return expPath;
@@ -261,7 +274,7 @@ int main()
         std::cout << "Saving to: " << expPath << std::endl;
         std::cout << "Format: " << IMG_W << "x" << IMG_H
                   << " 8-bit mono, " << (FRAME_BYTES / 1024 / 1024.0)
-                  << " MB/frame" << std::endl;
+                  << " MB/frame  stride=" << FRAME_STRIDE << " B" << std::endl;
 
         for (int i = 0; i < 4; ++i)
             g_cameras[i].writerThread = std::thread(writerThreadFunc, i);
@@ -360,12 +373,16 @@ int main()
             }
             g_cameras[i].writerThread.join();
 
-            // Write final frame count to metadata
             std::ofstream meta(g_cameras[i].savePath + "/metadata.txt", std::ios::app);
             meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
 
             CloseHandle(g_cameras[i].hFrames);
             g_cameras[i].tsFile.close();
+
+            for (auto* buf : g_cameras[i].bufs)
+                _aligned_free(buf);
+            g_cameras[i].bufs.clear();
+            g_cameras[i].matPool.clear();
         }
 
         IGXFactory::GetInstance().Uninit();
