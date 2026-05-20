@@ -15,10 +15,13 @@
 namespace fs = std::filesystem;
 
 // ── Config ────────────────────────────────────────────────────────
-const std::string SAVE_ROOT  = "recordings";
-const int         DISPLAY_W  = 800;
-const int         DISPLAY_H  = 667;
-const int         FPS        = 70;
+const std::string SAVE_ROOT = "recordings";
+const int         DISPLAY_W = 800;
+const int         DISPLAY_H = 667;
+const int         FPS       = 70;
+const int         IMG_W     = 2600;
+const int         IMG_H     = 2160;
+const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 
 const std::vector<std::string> CAM_LABELS = {
     "Cam 1  P1  master 10021",
@@ -27,24 +30,50 @@ const std::vector<std::string> CAM_LABELS = {
     "Cam 4  P2  slave  10013"
 };
 
-// ── Load sorted frame paths ───────────────────────────────────────
-std::vector<std::string> getFramePaths(const std::string& camFolder)
+// ── Read frame count from metadata.txt ───────────────────────────
+int getFrameCount(const std::string& camFolder)
 {
-    std::vector<std::string> paths;
-    if (!fs::exists(camFolder)) return paths;
-    for (const auto& entry : fs::directory_iterator(camFolder))
+    std::ifstream meta(camFolder + "/metadata.txt");
+    if (meta.is_open())
     {
-        auto ext = entry.path().extension();
-        if (ext == ".jpg" || ext == ".bin")
-            paths.push_back(entry.path().string());
+        std::string line;
+        while (std::getline(meta, line))
+        {
+            if (line.substr(0, 7) == "frames=")
+                return std::stoi(line.substr(7));
+        }
     }
-    std::sort(paths.begin(), paths.end());
-    return paths;
+    // Fallback: count rows in timestamps.csv (minus header)
+    std::ifstream ts(camFolder + "/timestamps.csv");
+    if (ts.is_open())
+    {
+        int count = -1;
+        std::string line;
+        while (std::getline(ts, line)) ++count;
+        return std::max(0, count);
+    }
+    return 0;
+}
+
+// ── Load a single frame from frames.bin by index ─────────────────
+cv::Mat loadFrame(const std::string& camFolder, int frameIdx)
+{
+    std::ifstream f(camFolder + "/frames.bin", std::ios::binary);
+    if (!f.is_open()) return {};
+
+    f.seekg((std::streamoff)frameIdx * (std::streamoff)FRAME_BYTES);
+    if (!f) return {};
+
+    cv::Mat gray(IMG_H, IMG_W, CV_8UC1);
+    f.read(reinterpret_cast<char*>(gray.data), FRAME_BYTES);
+    if (!f) return {};
+
+    return gray;
 }
 
 // ── Load timestamps from CSV ──────────────────────────────────────
-// Returns timestamps in original ticks (one per frame, in frame order).
-// Assumes 1 tick = 1 ns (1 GHz camera clock — adjust if your model differs).
+// CSV format: saved_index,frame_index,timestamp_ticks
+// Assumes 1 tick = 1 ns (1 GHz camera clock).
 std::vector<uint64_t> loadTimestamps(const std::string& camFolder)
 {
     std::vector<uint64_t> ts;
@@ -54,9 +83,11 @@ std::vector<uint64_t> loadTimestamps(const std::string& camFolder)
     std::getline(f, line); // skip header
     while (std::getline(f, line))
     {
-        auto comma = line.find(',');
-        if (comma == std::string::npos) continue;
-        ts.push_back(std::stoull(line.substr(comma + 1)));
+        auto c1 = line.find(',');
+        if (c1 == std::string::npos) continue;
+        auto c2 = line.find(',', c1 + 1);
+        if (c2 == std::string::npos) continue;
+        ts.push_back(std::stoull(line.substr(c2 + 1)));
     }
     return ts;
 }
@@ -148,7 +179,9 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames, int frameIdx, int totalFra
         }
         else
         {
-            cv::resize(frames[i], cell, { DISPLAY_W, DISPLAY_H });
+            cv::Mat bgr;
+            cv::cvtColor(frames[i], bgr, cv::COLOR_GRAY2BGR);
+            cv::resize(bgr, cell, { DISPLAY_W, DISPLAY_H });
         }
 
         cv::putText(cell, CAM_LABELS[i], { 10, 30 },
@@ -202,18 +235,15 @@ int main()
         expPath + "/camera_4"
     };
 
-    // Load frames and timestamps
-    std::vector<std::vector<std::string>> allFramePaths(4);
-    std::vector<std::vector<uint64_t>>   allTimestamps(4);
-    std::vector<int>                     frameCounts(4, 0);
+    std::vector<std::vector<uint64_t>> allTimestamps(4);
+    std::vector<int>                   frameCounts(4, 0);
     int maxFrames = 0;
 
     for (int i = 0; i < 4; ++i)
     {
-        allFramePaths[i]  = getFramePaths(camFolders[i]);
-        allTimestamps[i]  = loadTimestamps(camFolders[i]);
-        frameCounts[i]    = (int)allFramePaths[i].size();
-        maxFrames         = std::max(maxFrames, frameCounts[i]);
+        frameCounts[i]   = getFrameCount(camFolders[i]);
+        allTimestamps[i] = loadTimestamps(camFolders[i]);
+        maxFrames        = std::max(maxFrames, frameCounts[i]);
         std::cout << "Camera " << (i + 1) << ": " << frameCounts[i] << " frames  "
                   << allTimestamps[i].size() << " timestamps" << std::endl;
     }
@@ -244,20 +274,8 @@ int main()
             std::vector<cv::Mat> frames(4);
             for (int i = 0; i < 4; ++i)
             {
-                if (frameIdx < (int)allFramePaths[i].size())
-                {
-                    const auto& path = allFramePaths[i][frameIdx];
-                    if (path.size() >= 4 && path.substr(path.size()-4) == ".bin")
-                    {
-                        std::ifstream f(path, std::ios::binary);
-                        cv::Mat gray(2160, 2600, CV_8UC1);
-                        f.read(reinterpret_cast<char*>(gray.data),
-                               gray.total() * gray.elemSize());
-                        cv::cvtColor(gray, frames[i], cv::COLOR_GRAY2BGR);
-                    }
-                    else
-                        frames[i] = cv::imread(path);
-                }
+                if (frameIdx < frameCounts[i])
+                    frames[i] = loadFrame(camFolders[i], frameIdx);
             }
 
             cv::Mat grid = buildGrid(frames, frameIdx, maxFrames);

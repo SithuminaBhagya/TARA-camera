@@ -16,7 +16,7 @@
 
 namespace fs = std::filesystem;
 
-// index 0 = master (JCK26010021 / Camera 1), indices 1-3 = slaves
+// index 0 = master (Camera 1), indices 1-3 = slaves (Cameras 2-4)
 const std::vector<std::string> CAM_SNS = {
     "JCK26010021",  // Camera 1 — master
     "JCK26010020",  // Camera 2 — slave
@@ -25,22 +25,34 @@ const std::vector<std::string> CAM_SNS = {
 };
 
 const std::string SAVE_ROOT = "recordings";
+const int         IMG_W     = 2600;
+const int         IMG_H     = 2160;
+const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H; // 8-bit mono, 1 byte/pixel
 
 // ── Frame item passed from callback to writer thread ──────────────
 struct FrameItem
 {
-    cv::Mat  image;
-    int      frameIndex;
+    cv::Mat  image;       // CV_8UC1 grayscale
+    int      frameIndex;  // callback-assigned index (may have gaps if dropped)
     uint64_t timestamp;
 };
 
 // ── Per-camera state ──────────────────────────────────────────────
 struct CameraState
 {
-    std::atomic<int>  frameCount{ 0 };    // frames received by callback
+    std::atomic<int>  frameCount{ 0 };    // total frames received by callback
+    std::atomic<int>  savedCount{ 0 };    // frames actually written to disk
     std::atomic<int>  droppedCount{ 0 };  // frames dropped (queue full)
     std::string       savePath;
-    std::ofstream     tsFile;
+
+    // One continuous binary file — pure sequential writes, no per-frame open/close.
+    // Format: raw 8-bit grayscale frames back-to-back, IMG_W × IMG_H bytes each.
+    // Read frame N: seek to N × FRAME_BYTES, read FRAME_BYTES bytes.
+    std::ofstream framesFile;
+
+    // Timestamps: saved_index (row 0,1,2...) maps to row in this CSV.
+    // saved_index == position in framesFile (row 0 = first written frame, etc.)
+    std::ofstream tsFile;
 
     std::queue<FrameItem>    writeQueue;
     std::mutex               queueMtx;
@@ -48,9 +60,9 @@ struct CameraState
     std::atomic<bool>        stopWriter{ false };
     std::thread              writerThread;
 
-    // 16 frames × 16.8 MB = ~268 MB per camera buffer.
-    // If "dropped > 0" in the final report, increase this or use faster storage.
-    static const int MAX_QUEUE_DEPTH = 16;
+    // 48 frames × 5.6 MB = ~268 MB per camera.
+    // 3× deeper than before at same RAM cost (was 16 × 16.8 MB).
+    static const int MAX_QUEUE_DEPTH = 48;
 
     CameraState() = default;
     CameraState(const CameraState&) = delete;
@@ -60,8 +72,6 @@ struct CameraState
 CameraState g_cameras[4];
 
 // ── Writer thread — one per camera ───────────────────────────────
-// Runs independently of the SDK callback thread.
-// Drains the queue completely before exiting so no frames are lost on shutdown.
 void writerThreadFunc(int camIdx)
 {
     auto& cam = g_cameras[camIdx];
@@ -76,27 +86,26 @@ void writerThreadFunc(int camIdx)
             });
 
             if (cam.writeQueue.empty())
-                break; // stop requested and queue fully drained
+                break; // stop requested, queue fully drained
 
             item = std::move(cam.writeQueue.front());
             cam.writeQueue.pop();
         }
 
-        // Raw binary — grayscale, 8-bit, 2600×2160, 1 byte/pixel = 5.6 MB/frame.
-        // Read back: cv::Mat img(2160, 2600, CV_8UC1); fread into img.data
-        std::ostringstream ss;
-        ss << cam.savePath << "/frame_"
-           << std::setw(6) << std::setfill('0') << item.frameIndex << ".bin";
-        std::ofstream rawFile(ss.str(), std::ios::binary);
-        rawFile.write(reinterpret_cast<const char*>(item.image.data),
-                      item.image.total() * item.image.elemSize());
+        // Sequential write into the continuous frames file
+        cam.framesFile.write(
+            reinterpret_cast<const char*>(item.image.data), FRAME_BYTES);
 
-        // Write timestamp
-        cam.tsFile << item.frameIndex << "," << item.timestamp << "\n";
+        // Row number in CSV = position in binary file
+        int savedIdx = cam.savedCount.fetch_add(1);
+        cam.tsFile << savedIdx << "," << item.frameIndex << "," << item.timestamp << "\n";
     }
+
+    cam.framesFile.flush();
+    cam.tsFile.flush();
 }
 
-// ── Callback — runs on SDK thread, must return fast ──────────────
+// ── Callback — must return fast ──────────────────────────────────
 class CCaptureHandler : public ICaptureEventHandler
 {
 public:
@@ -108,19 +117,14 @@ public:
         if (imgPtr->GetStatus() != GX_FRAME_STATUS_SUCCESS)
             return;
 
-        int width    = (int)imgPtr->GetWidth();
-        int height   = (int)imgPtr->GetHeight();
-        uint64_t ts  = imgPtr->GetTimeStamp();
+        uint64_t ts = imgPtr->GetTimeStamp();
 
-        // Keep grayscale — mono sensor, no BGR conversion needed.
-        // Saves 3× disk space and bandwidth, correct for DIC.
         void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
-        cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
+        cv::Mat grayMat(IMG_H, IMG_W, CV_8UC1, pRaw8);
 
         auto& cam   = g_cameras[m_index];
         int   count = cam.frameCount.fetch_add(1);
 
-        // Push to writer queue — never block here
         {
             std::lock_guard<std::mutex> lock(cam.queueMtx);
             if ((int)cam.writeQueue.size() < CameraState::MAX_QUEUE_DEPTH)
@@ -136,7 +140,7 @@ public:
     }
 };
 
-// ── Folder creation ───────────────────────────────────────────────
+// ── Folder + file creation ────────────────────────────────────────
 std::string createExperimentFolder()
 {
     fs::create_directories(SAVE_ROOT);
@@ -155,8 +159,19 @@ std::string createExperimentFolder()
         std::string path = expPath + "/camera_" + std::to_string(i + 1);
         fs::create_directories(path);
         g_cameras[i].savePath = path;
+
+        g_cameras[i].framesFile.open(path + "/frames.bin", std::ios::binary);
+
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
-        g_cameras[i].tsFile << "frame_index,timestamp_ticks\n";
+        g_cameras[i].tsFile << "saved_index,frame_index,timestamp_ticks\n";
+
+        // Metadata file for DIC software and playback
+        std::ofstream meta(path + "/metadata.txt");
+        meta << "width="    << IMG_W    << "\n"
+             << "height="   << IMG_H    << "\n"
+             << "channels=1\n"
+             << "dtype=uint8\n"
+             << "byte_order=little_endian\n";
     }
 
     return expPath;
@@ -194,8 +209,10 @@ int main()
 
         std::string expPath = createExperimentFolder();
         std::cout << "Saving to: " << expPath << std::endl;
+        std::cout << "Format: " << IMG_W << "x" << IMG_H
+                  << " 8-bit mono, " << (FRAME_BYTES / 1024 / 1024.0)
+                  << " MB/frame" << std::endl;
 
-        // Start writer threads before acquisition begins
         for (int i = 0; i < 4; ++i)
             g_cameras[i].writerThread = std::thread(writerThreadFunc, i);
 
@@ -212,8 +229,8 @@ int main()
 
             featureControls[i] = cameras[i]->GetRemoteFeatureControl();
 
-            featureControls[i]->GetIntFeature("Width")->SetValue(2600);
-            featureControls[i]->GetIntFeature("Height")->SetValue(2160);
+            featureControls[i]->GetIntFeature("Width")->SetValue(IMG_W);
+            featureControls[i]->GetIntFeature("Height")->SetValue(IMG_H);
             featureControls[i]->GetIntFeature("OffsetX")->SetValue(0);
             featureControls[i]->GetIntFeature("OffsetY")->SetValue(0);
             featureControls[i]->GetIntFeature("DeviceLinkThroughputLimit")->SetValue(400000000);
@@ -233,24 +250,22 @@ int main()
             streams[i]->RegisterCaptureCallback(callbacks[i].get(), nullptr);
 
             std::string role = (i == 0) ? "master" : "slave";
-            std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i] << ", " << role << ") configured." << std::endl;
+            std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i]
+                      << ", " << role << ") configured." << std::endl;
         }
 
-        // Arm all buffer queues
         for (int i = 0; i < 4; ++i)
             streams[i]->StartGrab();
 
-        // Start slaves first — they wait for trigger
         for (int i = 1; i < 4; ++i)
         {
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
-            std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i] << ") armed." << std::endl;
+            std::cout << "Camera " << (i + 1) << " armed." << std::endl;
         }
 
-        // Start master last — begins sending trigger pulses
         featureControls[0]->GetCommandFeature("AcquisitionStart")->Execute();
-        std::cout << "Camera 1 (" << CAM_SNS[0] << ") started." << std::endl;
-        std::cout << "\nRecording... Press Q to stop.\n" << std::endl;
+        std::cout << "Camera 1 started.\n" << std::endl;
+        std::cout << "Recording... Press Q to stop.\n" << std::endl;
 
         while (true)
         {
@@ -261,7 +276,6 @@ int main()
                     break;
             }
 
-            // Print live queue depths so you can see if disk is keeping up
             std::cout << "\r  Queue: ";
             for (int i = 0; i < 4; ++i)
             {
@@ -273,7 +287,6 @@ int main()
             Sleep(500);
         }
 
-        // Stop master first — no more trigger pulses
         std::cout << "\n\nStopping acquisition..." << std::endl;
         featureControls[0]->GetCommandFeature("AcquisitionStop")->Execute();
         for (int i = 1; i < 4; ++i)
@@ -287,7 +300,6 @@ int main()
             cameras[i]->Close();
         }
 
-        // Signal writer threads to finish draining then exit
         std::cout << "Flushing write queues (waiting for disk)..." << std::endl;
         for (int i = 0; i < 4; ++i)
         {
@@ -297,23 +309,33 @@ int main()
                 g_cameras[i].queueCv.notify_one();
             }
             g_cameras[i].writerThread.join();
+
+            // Write final frame count to metadata
+            std::ofstream meta(g_cameras[i].savePath + "/metadata.txt", std::ios::app);
+            meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
+
+            g_cameras[i].framesFile.close();
             g_cameras[i].tsFile.close();
         }
 
         IGXFactory::GetInstance().Uninit();
 
         std::cout << "\nResults:" << std::endl;
+        bool allMatch = true;
+        int firstCount = g_cameras[0].savedCount.load();
         for (int i = 0; i < 4; ++i)
         {
             std::string role = (i == 0) ? "master" : "slave ";
-            int captured = g_cameras[i].frameCount.load();
-            int dropped  = g_cameras[i].droppedCount.load();
-            std::cout << "  Camera " << (i + 1) << " (" << role << " " << CAM_SNS[i] << "): "
-                      << captured << " captured";
+            int saved   = g_cameras[i].savedCount.load();
+            int dropped = g_cameras[i].droppedCount.load();
+            if (saved != firstCount) allMatch = false;
+            std::cout << "  Camera " << (i + 1) << " (" << role << " "
+                      << CAM_SNS[i] << "): " << saved << " saved";
             if (dropped > 0)
-                std::cout << ",  " << dropped << " DROPPED (queue full — disk too slow)";
+                std::cout << ",  " << dropped << " dropped (queue full)";
             std::cout << std::endl;
         }
+        std::cout << (allMatch ? "  Frame count match: YES" : "  Frame count match: NO") << std::endl;
         std::cout << "Saved to: " << expPath << std::endl;
     }
     catch (CGalaxyException& e)
