@@ -153,7 +153,14 @@ int main()
             featureControls[i]->GetEnumFeature("AcquisitionMode")->SetValue("Continuous");
 
             if (i == 0)
+            {
+                // Limit master frame rate so disk I/O keeps up with all 4 cameras.
+                // At 10fps each camera gets ~100ms to write one JPEG — enough headroom.
+                // Raise this once you confirm sync is working.
+                featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
+                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(10.0);
                 configureMaster(featureControls[i]);
+            }
             else
                 configureSlave(featureControls[i]);
 
