@@ -21,10 +21,10 @@ const int         DISPLAY_H  = 667;
 const int         FPS        = 70;
 
 const std::vector<std::string> CAM_LABELS = {
-    "Cam 0  master 10021",
-    "Cam 1  slave  10020",
-    "Cam 2  slave  10019",
-    "Cam 3  slave  10013"
+    "Cam 1  P1  master 10021",
+    "Cam 2  P1  slave  10020",
+    "Cam 3  P2  slave  10019",
+    "Cam 4  P2  slave  10013"
 };
 
 // ── Load sorted frame paths ───────────────────────────────────────
@@ -81,7 +81,7 @@ void printSyncStats(const std::vector<std::vector<uint64_t>>& allTs,
         if (baseCount == -1) baseCount = n;
         else if (n != baseCount) countMatch = false;
 
-        std::cout << std::left << std::setw(26) << CAM_LABELS[i]
+        std::cout << std::left << std::setw(30) << CAM_LABELS[i]
                   << std::setw(9) << n;
 
         const auto& ts = allTs[i];
@@ -195,10 +195,10 @@ int main()
     std::string expPath = experiments[choice];
 
     std::vector<std::string> camFolders = {
-        expPath + "/camera_0",
         expPath + "/camera_1",
         expPath + "/camera_2",
-        expPath + "/camera_3"
+        expPath + "/camera_3",
+        expPath + "/camera_4"
     };
 
     // Load frames and timestamps
@@ -213,7 +213,7 @@ int main()
         allTimestamps[i]  = loadTimestamps(camFolders[i]);
         frameCounts[i]    = (int)allFramePaths[i].size();
         maxFrames         = std::max(maxFrames, frameCounts[i]);
-        std::cout << "Camera " << i << ": " << frameCounts[i] << " frames  "
+        std::cout << "Camera " << (i + 1) << ": " << frameCounts[i] << " frames  "
                   << allTimestamps[i].size() << " timestamps" << std::endl;
     }
 

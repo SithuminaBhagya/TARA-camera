@@ -173,9 +173,10 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
         // Colored border shows sync health at a glance
         cv::rectangle(cell, { 0, 0 }, { DISPLAY_W - 1, DISPLAY_H - 1 }, sync.border, 8);
 
-        // Camera label
+        // Camera label — Cam 1..4, Pair 1 = cams 1&2, Pair 2 = cams 3&4
         std::string role  = (i == 0) ? "MASTER" : "SLAVE";
-        std::string label = "Cam " + std::to_string(i) + "  " + role
+        std::string pair  = (i < 2)  ? "P1" : "P2";
+        std::string label = "Cam " + std::to_string(i + 1) + "  " + pair + "  " + role
                           + "  [" + CAM_SNS[i].substr(8) + "]";
         cv::putText(cell, label, { 14, 35 },
                     cv::FONT_HERSHEY_SIMPLEX, 0.75, { 0, 255, 0 }, 2);
@@ -284,7 +285,7 @@ int main()
             streams[i]->RegisterCaptureCallback(callbacks[i].get(), nullptr);
 
             std::string role = (i == 0) ? "master" : "slave";
-            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ", " << role << ") configured." << std::endl;
+            std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i] << ", " << role << ") configured." << std::endl;
         }
 
         // Arm all buffer queues first
@@ -295,7 +296,7 @@ int main()
         for (int i = 1; i < 4; ++i)
         {
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
-            std::cout << "Slave " << i << " (" << CAM_SNS[i] << ") armed." << std::endl;
+            std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i] << ") armed." << std::endl;
         }
 
         // Start master last — begins sending trigger pulses

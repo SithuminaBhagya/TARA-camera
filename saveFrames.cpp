@@ -82,9 +82,10 @@ std::string createExperimentFolder()
         expPath = ss.str();
     } while (fs::exists(expPath));
 
+    // camera_1..4 matching physical labelling (021=Cam1, 020=Cam2, 019=Cam3, 013=Cam4)
     for (int i = 0; i < 4; ++i)
     {
-        std::string path = expPath + "/camera_" + std::to_string(i);
+        std::string path = expPath + "/camera_" + std::to_string(i + 1);
         fs::create_directories(path);
         g_cameras[i].savePath = path;
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
@@ -159,7 +160,7 @@ int main()
             streams[i]->RegisterCaptureCallback(callbacks[i].get(), nullptr);
 
             std::string role = (i == 0) ? "master" : "slave";
-            std::cout << "Camera " << i << " (" << CAM_SNS[i] << ", " << role << ") configured." << std::endl;
+            std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i] << ", " << role << ") configured." << std::endl;
         }
 
         // Phase 1: Arm all buffer queues
@@ -170,7 +171,7 @@ int main()
         for (int i = 1; i < 4; ++i)
         {
             featureControls[i]->GetCommandFeature("AcquisitionStart")->Execute();
-            std::cout << "Slave " << i << " (" << CAM_SNS[i] << ") armed." << std::endl;
+            std::cout << "Camera " << (i + 1) << " (" << CAM_SNS[i] << ") armed." << std::endl;
         }
 
         // Phase 3: Start master last — it begins sending trigger pulses
@@ -210,7 +211,7 @@ int main()
         for (int i = 0; i < 4; ++i)
         {
             std::string role = (i == 0) ? "master" : "slave ";
-            std::cout << "  Cam " << i << " (" << role << " " << CAM_SNS[i] << "): "
+            std::cout << "  Camera " << (i + 1) << " (" << role << " " << CAM_SNS[i] << "): "
                       << g_cameras[i].frameCount << " frames" << std::endl;
         }
         std::cout << "Saved to: " << expPath << std::endl;
