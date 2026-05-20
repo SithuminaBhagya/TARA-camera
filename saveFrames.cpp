@@ -78,7 +78,9 @@ CameraState g_cameras[4];
 void writerThreadFunc(int camIdx)
 {
     auto& cam = g_cameras[camIdx];
-    int lastMatIdx = -1;
+    int    lastMatIdx  = -1;
+    double totalWriteMs = 0.0;
+    double maxWriteMs   = 0.0;
 
     while (true)
     {
@@ -104,9 +106,14 @@ void writerThreadFunc(int camIdx)
 
         // Sequential write into the continuous frames file
         DWORD written;
+        auto  t0 = std::chrono::steady_clock::now();
         WriteFile(cam.hFrames,
                   cam.matPool[item.matIdx].data,
                   (DWORD)FRAME_BYTES, &written, nullptr);
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+        totalWriteMs += ms;
+        if (ms > maxWriteMs) maxWriteMs = ms;
 
         int savedIdx = cam.savedCount.fetch_add(1);
         cam.tsFile << savedIdx << "," << item.frameIndex << "," << item.timestamp << "\n";
@@ -123,6 +130,16 @@ void writerThreadFunc(int camIdx)
 
     FlushFileBuffers(cam.hFrames);
     cam.tsFile.flush();
+
+    int saved = cam.savedCount.load();
+    if (saved > 0)
+    {
+        double avgMs = totalWriteMs / saved;
+        double mbps  = (FRAME_BYTES / 1024.0 / 1024.0) / (avgMs / 1000.0);
+        std::cout << "  Cam" << (camIdx + 1) << " write: avg " << std::fixed
+                  << std::setprecision(2) << avgMs << " ms  max " << maxWriteMs
+                  << " ms  (" << (int)mbps << " MB/s)" << std::endl;
+    }
 }
 
 // ── Callback — must return fast ──────────────────────────────────
