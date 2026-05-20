@@ -129,6 +129,26 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
     int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 
+    // ── Collective sync flash ─────────────────────────────────────
+    // USB delivery latency differs per camera (2-10ms), so per-camera
+    // flashes will always look staggered even when hardware sync is perfect.
+    // Instead: flash ALL cells together when all 4 received a frame
+    // within a 40ms window of each other — this absorbs the USB latency.
+    int64_t times[4];
+    for (int i = 0; i < 4; ++i)
+        times[i] = g_cameras[i].lastFrameMs.load();
+
+    bool allHaveFrames = (times[0] > 0 && times[1] > 0 && times[2] > 0 && times[3] > 0);
+    int64_t newest = *std::max_element(times, times + 4);
+    int64_t oldest = *std::min_element(times, times + 4);
+    int64_t spread = newest - oldest;   // ms between first and last callback in the group
+    int64_t groupAge = nowMs - newest;  // ms since the group completed
+
+    // All cameras fired within 40ms of each other = one sync pulse
+    const int64_t SYNC_WINDOW_MS = 40;
+    const int64_t FLASH_MS       = 150;
+    bool isSyncPulse = allHaveFrames && (spread <= SYNC_WINDOW_MS) && (groupAge < FLASH_MS);
+
     for (int i = 0; i < 4; ++i)
     {
         cv::Mat cell;
@@ -139,18 +159,16 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
 
         auto sync = evalSync(i);
 
-        // ── Green flash overlay when a frame just arrived ─────────
-        // All 4 cells flash green at the same instant when in sync —
-        // visually obvious even at 70fps.
-        int64_t lastMs = g_cameras[i].lastFrameMs.load();
-        int64_t age    = (lastMs < 0) ? 999999 : (nowMs - lastMs);
-        const int64_t FLASH_MS = 120;
-        if (age < FLASH_MS)
+        // Flash all 4 cells together on a sync pulse
+        if (isSyncPulse)
         {
-            double alpha = 0.45 * (1.0 - (double)age / FLASH_MS);
+            double alpha = 0.4 * (1.0 - (double)groupAge / FLASH_MS);
             cv::Mat green(cell.size(), cell.type(), cv::Scalar(0, 220, 0));
             cv::addWeighted(cell, 1.0 - alpha, green, alpha, 0, cell);
         }
+
+        int64_t lastMs = g_cameras[i].lastFrameMs.load();
+        int64_t age    = (lastMs < 0) ? 999999 : (nowMs - lastMs);
 
         // Colored border shows sync health at a glance
         cv::rectangle(cell, { 0, 0 }, { DISPLAY_W - 1, DISPLAY_H - 1 }, sync.border, 8);
@@ -185,14 +203,16 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
                         cv::FONT_HERSHEY_SIMPLEX, 0.65, dColor, 2);
         }
 
-        // Time since last frame — if cameras are in sync these should
-        // all read nearly the same value at the same moment
-        if (lastMs >= 0)
+        // USB delivery spread — shows how far apart callbacks fired
+        // across all 4 cameras. Should stay < 40ms even when in sync.
+        if (allHaveFrames)
         {
-            std::string ageStr = "Last frame: " + std::to_string(age) + " ms ago";
-            cv::Scalar ageColor = (age < 50) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 165, 255);
-            cv::putText(cell, ageStr, { 14, 183 },
-                        cv::FONT_HERSHEY_SIMPLEX, 0.65, ageColor, 2);
+            std::string spreadStr = "USB spread: " + std::to_string(spread) + " ms";
+            cv::Scalar spreadColor = (spread <= 40)  ? cv::Scalar(0, 255, 0)
+                                   : (spread <= 100) ? cv::Scalar(0, 165, 255)
+                                                     : cv::Scalar(0, 80, 255);
+            cv::putText(cell, spreadStr, { 14, 183 },
+                        cv::FONT_HERSHEY_SIMPLEX, 0.65, spreadColor, 2);
         }
 
         // "WAITING FOR TRIGGER" — proves slave is in trigger mode
