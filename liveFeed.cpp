@@ -30,6 +30,7 @@ struct CameraState
     std::atomic<int>      frameCount{ 0 };
     std::atomic<int>      fpsCount{ 0 };
     std::atomic<double>   fps{ 0.0 };
+    std::atomic<int64_t>  lastFrameMs{ -1 };  // wall-clock ms when last frame arrived
 
     CameraState() = default;
     CameraState(CameraState&& other) noexcept
@@ -37,7 +38,8 @@ struct CameraState
           hasNewFrame(other.hasNewFrame),
           frameCount(other.frameCount.load()),
           fpsCount(other.fpsCount.load()),
-          fps(other.fps.load()) {}
+          fps(other.fps.load()),
+          lastFrameMs(other.lastFrameMs.load()) {}
 };
 
 std::vector<CameraState> g_cameras(4);
@@ -65,6 +67,9 @@ public:
         auto& cam = g_cameras[m_index];
         cam.frameCount.fetch_add(1);
         cam.fpsCount.fetch_add(1);
+        cam.lastFrameMs.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
 
         std::lock_guard<std::mutex> lock(cam.mtx);
         cam.frame       = bgrMat.clone();
@@ -121,6 +126,9 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
     std::vector<cv::Mat> cells(4);
     int masterCount = g_cameras[0].frameCount.load();
 
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
     for (int i = 0; i < 4; ++i)
     {
         cv::Mat cell;
@@ -131,13 +139,26 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
 
         auto sync = evalSync(i);
 
+        // ── Green flash overlay when a frame just arrived ─────────
+        // All 4 cells flash green at the same instant when in sync —
+        // visually obvious even at 70fps.
+        int64_t lastMs = g_cameras[i].lastFrameMs.load();
+        int64_t age    = (lastMs < 0) ? 999999 : (nowMs - lastMs);
+        const int64_t FLASH_MS = 120;
+        if (age < FLASH_MS)
+        {
+            double alpha = 0.45 * (1.0 - (double)age / FLASH_MS);
+            cv::Mat green(cell.size(), cell.type(), cv::Scalar(0, 220, 0));
+            cv::addWeighted(cell, 1.0 - alpha, green, alpha, 0, cell);
+        }
+
         // Colored border shows sync health at a glance
         cv::rectangle(cell, { 0, 0 }, { DISPLAY_W - 1, DISPLAY_H - 1 }, sync.border, 8);
 
         // Camera label
         std::string role  = (i == 0) ? "MASTER" : "SLAVE";
         std::string label = "Cam " + std::to_string(i) + "  " + role
-                          + "  [" + CAM_SNS[i].substr(8) + "]"; // show last digits of SN
+                          + "  [" + CAM_SNS[i].substr(8) + "]";
         cv::putText(cell, label, { 14, 35 },
                     cv::FONT_HERSHEY_SIMPLEX, 0.75, { 0, 255, 0 }, 2);
 
@@ -162,6 +183,28 @@ cv::Mat buildGrid(const std::vector<cv::Mat>& frames)
                                                        : cv::Scalar(0, 80, 255);
             cv::putText(cell, dStr, { 14, 146 },
                         cv::FONT_HERSHEY_SIMPLEX, 0.65, dColor, 2);
+        }
+
+        // Time since last frame — if cameras are in sync these should
+        // all read nearly the same value at the same moment
+        if (lastMs >= 0)
+        {
+            std::string ageStr = "Last frame: " + std::to_string(age) + " ms ago";
+            cv::Scalar ageColor = (age < 50) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 165, 255);
+            cv::putText(cell, ageStr, { 14, 183 },
+                        cv::FONT_HERSHEY_SIMPLEX, 0.65, ageColor, 2);
+        }
+
+        // "WAITING FOR TRIGGER" — proves slave is in trigger mode
+        // and blocking correctly before first frame arrives
+        if (g_cameras[i].frameCount.load() == 0 && i > 0)
+        {
+            cv::Mat dark = cell.clone();
+            cv::addWeighted(cell, 0.4, dark, 0.0, 0, cell);
+            cv::putText(cell, "WAITING FOR", { DISPLAY_W / 2 - 160, DISPLAY_H / 2 - 20 },
+                        cv::FONT_HERSHEY_SIMPLEX, 1.4, { 0, 255, 255 }, 3);
+            cv::putText(cell, "TRIGGER...", { DISPLAY_W / 2 - 135, DISPLAY_H / 2 + 50 },
+                        cv::FONT_HERSHEY_SIMPLEX, 1.4, { 0, 255, 255 }, 3);
         }
 
         // Total frames (bottom)
