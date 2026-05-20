@@ -82,11 +82,14 @@ void writerThreadFunc(int camIdx)
             cam.writeQueue.pop();
         }
 
-        // Write JPEG
+        // Raw binary — grayscale, 8-bit, 2600×2160, 1 byte/pixel = 5.6 MB/frame.
+        // Read back: cv::Mat img(2160, 2600, CV_8UC1); fread into img.data
         std::ostringstream ss;
         ss << cam.savePath << "/frame_"
-           << std::setw(6) << std::setfill('0') << item.frameIndex << ".jpg";
-        cv::imwrite(ss.str(), item.image, { cv::IMWRITE_JPEG_QUALITY, 95 });
+           << std::setw(6) << std::setfill('0') << item.frameIndex << ".bin";
+        std::ofstream rawFile(ss.str(), std::ios::binary);
+        rawFile.write(reinterpret_cast<const char*>(item.image.data),
+                      item.image.total() * item.image.elemSize());
 
         // Write timestamp
         cam.tsFile << item.frameIndex << "," << item.timestamp << "\n";
@@ -109,10 +112,10 @@ public:
         int height   = (int)imgPtr->GetHeight();
         uint64_t ts  = imgPtr->GetTimeStamp();
 
+        // Keep grayscale — mono sensor, no BGR conversion needed.
+        // Saves 3× disk space and bandwidth, correct for DIC.
         void* pRaw8 = imgPtr->ConvertToRaw8(GX_BIT_0_7);
         cv::Mat grayMat(height, width, CV_8UC1, pRaw8);
-        cv::Mat bgrMat;
-        cv::cvtColor(grayMat, bgrMat, cv::COLOR_GRAY2BGR);
 
         auto& cam   = g_cameras[m_index];
         int   count = cam.frameCount.fetch_add(1);
@@ -122,7 +125,7 @@ public:
             std::lock_guard<std::mutex> lock(cam.queueMtx);
             if ((int)cam.writeQueue.size() < CameraState::MAX_QUEUE_DEPTH)
             {
-                cam.writeQueue.push({ bgrMat.clone(), count, ts });
+                cam.writeQueue.push({ grayMat.clone(), count, ts });
                 cam.queueCv.notify_one();
             }
             else

@@ -34,7 +34,8 @@ std::vector<std::string> getFramePaths(const std::string& camFolder)
     if (!fs::exists(camFolder)) return paths;
     for (const auto& entry : fs::directory_iterator(camFolder))
     {
-        if (entry.path().extension() == ".jpg")
+        auto ext = entry.path().extension();
+        if (ext == ".jpg" || ext == ".bin")
             paths.push_back(entry.path().string());
     }
     std::sort(paths.begin(), paths.end());
@@ -244,7 +245,19 @@ int main()
             for (int i = 0; i < 4; ++i)
             {
                 if (frameIdx < (int)allFramePaths[i].size())
-                    frames[i] = cv::imread(allFramePaths[i][frameIdx]);
+                {
+                    const auto& path = allFramePaths[i][frameIdx];
+                    if (path.size() >= 4 && path.substr(path.size()-4) == ".bin")
+                    {
+                        std::ifstream f(path, std::ios::binary);
+                        cv::Mat gray(2160, 2600, CV_8UC1);
+                        f.read(reinterpret_cast<char*>(gray.data),
+                               gray.total() * gray.elemSize());
+                        cv::cvtColor(gray, frames[i], cv::COLOR_GRAY2BGR);
+                    }
+                    else
+                        frames[i] = cv::imread(path);
+                }
             }
 
             cv::Mat grid = buildGrid(frames, frameIdx, maxFrames);
