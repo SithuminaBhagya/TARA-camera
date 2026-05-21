@@ -5,7 +5,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
-#include <queue>
+#include <deque>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -69,6 +69,11 @@ struct CameraState
     std::vector<int>      freeBufs;
     std::mutex            freeBufsMtx;
 
+    // Overlapped write state — one active async write per camera at a time
+    OVERLAPPED  ov{};
+    HANDLE      hWriteEvent{ INVALID_HANDLE_VALUE };
+    uint64_t    nextWriteOffset{ 0 };
+
     // 48 frames × 5.6 MB = ~268 MB per camera.
     static const int MAX_QUEUE_DEPTH = 48;
 
@@ -82,7 +87,7 @@ CameraState g_cameras[4];
 // ── Single global writer — one thread handles all cameras ─────────
 // Four concurrent writer threads were serialized by the Windows I/O
 // Manager, multiplying ~1 ms NVMe writes into ~120 ms stalls.
-std::queue<FrameItem>    g_writeQueue;
+std::deque<FrameItem>    g_writeQueue;
 std::mutex               g_queueMtx;
 std::condition_variable  g_queueCv;
 std::atomic<bool>        g_stopWriter{ false };
@@ -90,55 +95,113 @@ std::thread              g_writerThread;
 
 void writerThreadFunc()
 {
-    int    lastCamIdx      = -1;
-    int    lastBufIdx      = -1;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
     double totalWriteMs[4] = {};
     double maxWriteMs[4]   = {};
+    int    pendingBuf[4]   = { -1, -1, -1, -1 };
+    FrameItem pendingItem[4] = {};
 
     while (true)
     {
-        FrameItem item;
+        // ── Collect one item per camera from the global queue ─────────
+        FrameItem items[4];
+        bool      hasItem[4] = {};
+
         {
-            std::unique_lock<std::mutex> lock(g_queueMtx);
-            g_queueCv.wait(lock, []{
+            std::unique_lock<std::mutex> lk(g_queueMtx);
+            g_queueCv.wait(lk, []{
                 return !g_writeQueue.empty() || g_stopWriter.load();
             });
-
             if (g_writeQueue.empty())
                 break;
 
-            item = g_writeQueue.front();
-            g_writeQueue.pop();
+            // Scan deque front-to-back; pick first occurrence of each camera.
+            // Cameras are hardware-synced so items are nearly interleaved —
+            // typically we find all 4 in the first 4-8 elements.
+            for (auto it = g_writeQueue.begin(); it != g_writeQueue.end(); )
+            {
+                if (!hasItem[it->camIdx])
+                {
+                    items[it->camIdx] = *it;
+                    hasItem[it->camIdx] = true;
+                    it = g_writeQueue.erase(it);
+                    if (hasItem[0] && hasItem[1] && hasItem[2] && hasItem[3])
+                        break;
+                }
+                else
+                    ++it;
+            }
         }
 
-        // Return previous buffer now that we've claimed the next item
-        if (lastBufIdx >= 0)
+        // ── Return buffers from the PREVIOUS batch ────────────────────
+        for (int i = 0; i < 4; ++i)
         {
-            std::lock_guard<std::mutex> lk(g_cameras[lastCamIdx].freeBufsMtx);
-            g_cameras[lastCamIdx].freeBufs.push_back(lastBufIdx);
+            if (pendingBuf[i] >= 0)
+            {
+                std::lock_guard<std::mutex> lk(g_cameras[i].freeBufsMtx);
+                g_cameras[i].freeBufs.push_back(pendingBuf[i]);
+                pendingBuf[i] = -1;
+            }
         }
 
-        auto& cam = g_cameras[item.camIdx];
-        DWORD written;
-        auto  t0 = std::chrono::steady_clock::now();
-        WriteFile(cam.hFrames, cam.bufs[item.bufIdx],
-                  (DWORD)FRAME_STRIDE, &written, nullptr);
+        // ── Issue overlapped writes for every camera that has an item ──
+        int    activeCount = 0;
+        HANDLE waitEvents[4];
+        int    activeCams[4];
+        auto   t0 = std::chrono::steady_clock::now();
+
+        for (int i = 0; i < 4; ++i)
+        {
+            if (!hasItem[i]) continue;
+
+            auto& cam = g_cameras[i];
+            cam.ov            = {};
+            cam.ov.hEvent     = cam.hWriteEvent;
+            cam.ov.Offset     = (DWORD)(cam.nextWriteOffset & 0xFFFFFFFF);
+            cam.ov.OffsetHigh = (DWORD)(cam.nextWriteOffset >> 32);
+            cam.nextWriteOffset += FRAME_STRIDE;
+            ResetEvent(cam.hWriteEvent);
+
+            // Returns immediately (ERROR_IO_PENDING) — NVMe queues the command
+            WriteFile(cam.hFrames, cam.bufs[items[i].bufIdx],
+                      (DWORD)FRAME_STRIDE, nullptr, &cam.ov);
+
+            pendingBuf[i]   = items[i].bufIdx;
+            pendingItem[i]  = items[i];
+            waitEvents[activeCount] = cam.hWriteEvent;
+            activeCams[activeCount] = i;
+            ++activeCount;
+        }
+
+        if (activeCount == 0) continue;
+
+        // ── Wait for ALL issued writes to complete in parallel ─────────
+        WaitForMultipleObjects(activeCount, waitEvents, TRUE, INFINITE);
         double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
-        totalWriteMs[item.camIdx] += ms;
-        if (ms > maxWriteMs[item.camIdx]) maxWriteMs[item.camIdx] = ms;
 
-        int savedIdx = cam.savedCount.fetch_add(1);
-        cam.tsFile << savedIdx << "," << item.frameIndex << "," << item.timestamp << "\n";
+        for (int k = 0; k < activeCount; ++k)
+        {
+            int i = activeCams[k];
+            totalWriteMs[i] += ms;
+            if (ms > maxWriteMs[i]) maxWriteMs[i] = ms;
 
-        lastCamIdx = item.camIdx;
-        lastBufIdx = item.bufIdx;
+            int savedIdx = g_cameras[i].savedCount.fetch_add(1);
+            g_cameras[i].tsFile << savedIdx << ","
+                                << pendingItem[i].frameIndex << ","
+                                << pendingItem[i].timestamp  << "\n";
+        }
     }
 
-    if (lastBufIdx >= 0)
+    // ── Return last batch's buffers ───────────────────────────────────
+    for (int i = 0; i < 4; ++i)
     {
-        std::lock_guard<std::mutex> lk(g_cameras[lastCamIdx].freeBufsMtx);
-        g_cameras[lastCamIdx].freeBufs.push_back(lastBufIdx);
+        if (pendingBuf[i] >= 0)
+        {
+            std::lock_guard<std::mutex> lk(g_cameras[i].freeBufsMtx);
+            g_cameras[i].freeBufs.push_back(pendingBuf[i]);
+        }
     }
 
     for (int i = 0; i < 4; ++i)
@@ -199,7 +262,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(g_queueMtx);
-            g_writeQueue.push({ m_index, bufIdx, count, ts });
+            g_writeQueue.push_back({ m_index, bufIdx, count, ts });
         }
         g_queueCv.notify_one();
     }
@@ -231,8 +294,12 @@ std::string createExperimentFolder()
         g_cameras[i].hFrames = CreateFileA(
             (path + "/frames.bin").c_str(),
             GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
+            FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
+
+        g_cameras[i].hWriteEvent  = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        g_cameras[i].nextWriteOffset = 0;
 
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
         g_cameras[i].tsFile << "saved_index,frame_index,timestamp_ticks\n";
@@ -397,6 +464,7 @@ int main()
             meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
 
             CloseHandle(g_cameras[i].hFrames);
+            CloseHandle(g_cameras[i].hWriteEvent);
             g_cameras[i].tsFile.close();
 
             for (auto* buf : g_cameras[i].bufs)
