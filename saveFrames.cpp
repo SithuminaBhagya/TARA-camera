@@ -75,8 +75,9 @@ struct CameraState
     int       batchFillCount{ 0 };
     FrameItem batchItems[BATCH_SIZE];   // metadata for frames waiting in batchBuf
 
-    // 48 frames × 5.6 MB = ~268 MB per camera.
-    static const int MAX_QUEUE_DEPTH = 48;
+    // 128 frames × 5.6 MB = ~718 MB per camera (~2.9 GB total for 4 cameras).
+    // Needs to cover worst-case WriteFile duration (max ~2.4s × 70fps = 168 frames).
+    static const int MAX_QUEUE_DEPTH = 128;
 
     CameraState() = default;
     CameraState(const CameraState&) = delete;
