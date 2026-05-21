@@ -19,7 +19,7 @@ namespace fs = std::filesystem;
 const std::string SAVE_ROOT = "recordings";
 const int         DISPLAY_W = 800;
 const int         DISPLAY_H = 667;
-const int         FPS       = 15;
+const int         FPS       = 10;
 const int         IMG_W     = 2600;
 const int         IMG_H     = 2160;
 const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
@@ -69,13 +69,29 @@ int getFrameCountFallback(const std::string& camFolder)
     return std::max(0, count);
 }
 
-// ── PNG offset table: scan frames.bin once, record byte offset of each frame ──
-// File layout: [u32 size][PNG bytes] [u32 size][PNG bytes] ...
-std::vector<uint64_t> buildPngOffsets(const std::string& camFolder)
+// ── PNG frame location: which chunk file, what byte offset ────────
+// chunkIndex == -1 means single-file PNG (legacy frames.bin in same folder)
+struct FrameLoc
 {
-    std::vector<uint64_t> offsets;
-    std::ifstream f(camFolder + "/frames.bin", std::ios::binary);
-    if (!f.is_open()) return offsets;
+    int      chunkIndex;
+    uint64_t byteOffset;
+};
+
+std::string chunkFilename(const std::string& camFolder, int chunkIdx)
+{
+    std::ostringstream ss;
+    ss << camFolder << "/chunk_"
+       << std::setw(3) << std::setfill('0') << chunkIdx << ".bin";
+    return ss.str();
+}
+
+// Scan one PNG file and append frame offsets. File layout:
+// [u32 size][PNG bytes] [u32 size][PNG bytes] ...
+static void scanPngFile(const std::string& path, int chunkIdx,
+                        std::vector<FrameLoc>& out)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return;
 
     uint64_t pos = 0;
     while (true)
@@ -83,21 +99,49 @@ std::vector<uint64_t> buildPngOffsets(const std::string& camFolder)
         uint32_t size = 0;
         f.read(reinterpret_cast<char*>(&size), sizeof(size));
         if (!f || size == 0) break;
-        offsets.push_back(pos);
+        out.push_back({ chunkIdx, pos });
         pos += sizeof(size) + size;
         f.seekg(pos);
         if (!f) break;
     }
-    return offsets;
 }
 
-// ── Load a single PNG-compressed frame ───────────────────────────
-cv::Mat loadFramePng(const std::string& camFolder, uint64_t offset)
+// Build the full frame offset table for a camera folder. Walks every
+// chunk_NNN.bin in order; falls back to single frames.bin if no chunks exist.
+std::vector<FrameLoc> buildPngOffsets(const std::string& camFolder)
 {
-    std::ifstream f(camFolder + "/frames.bin", std::ios::binary);
+    std::vector<FrameLoc> locs;
+
+    // Chunked recording (current format)
+    if (fs::exists(chunkFilename(camFolder, 0)))
+    {
+        for (int idx = 0; ; ++idx)
+        {
+            std::string path = chunkFilename(camFolder, idx);
+            if (!fs::exists(path)) break;
+            scanPngFile(path, idx, locs);
+        }
+        return locs;
+    }
+
+    // Legacy single-file PNG recording
+    if (fs::exists(camFolder + "/frames.bin"))
+        scanPngFile(camFolder + "/frames.bin", -1, locs);
+
+    return locs;
+}
+
+// ── Load a single PNG-compressed frame from its chunk ─────────────
+cv::Mat loadFramePng(const std::string& camFolder, const FrameLoc& loc)
+{
+    std::string path = (loc.chunkIndex < 0)
+        ? camFolder + "/frames.bin"
+        : chunkFilename(camFolder, loc.chunkIndex);
+
+    std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return {};
 
-    f.seekg((std::streamoff)offset);
+    f.seekg((std::streamoff)loc.byteOffset);
     uint32_t size = 0;
     f.read(reinterpret_cast<char*>(&size), sizeof(size));
     if (!f || size == 0) return {};
@@ -289,7 +333,7 @@ int main()
 
     std::vector<CamMeta>                 metas(4);
     std::vector<std::vector<uint64_t>>   allTimestamps(4);
-    std::vector<std::vector<uint64_t>>   pngOffsets(4);
+    std::vector<std::vector<FrameLoc>>   pngOffsets(4);
     std::vector<int>                     frameCounts(4, 0);
     int maxFrames = 0;
 
@@ -343,9 +387,9 @@ int main()
             for (int i = 0; i < 4; ++i)
             {
                 if (frameIdx >= frameCounts[i]) continue;
-                if (metas[i].format == "png")
+                if (metas[i].format == "png" && frameIdx < (int)pngOffsets[i].size())
                     frames[i] = loadFramePng(camFolders[i], pngOffsets[i][frameIdx]);
-                else
+                else if (metas[i].format != "png")
                     frames[i] = loadFrameRaw(camFolders[i], frameIdx, metas[i].frameStride);
             }
 
