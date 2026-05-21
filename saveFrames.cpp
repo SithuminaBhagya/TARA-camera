@@ -215,33 +215,6 @@ public:
     }
 };
 
-// ── Pre-allocation helpers ────────────────────────────────────────
-// Pre-allocating disk space before recording eliminates NTFS cluster-allocation
-// overhead (VCB lock contention) during WriteFile, so writes hit pre-existing
-// extents exactly like the disktest benchmark does.
-
-// 60 seconds × 70 fps per camera — adjust if longer recordings are needed.
-// Four cameras × 22 GB = 88 GB reserved on disk, released after recording.
-const LONGLONG PREALLOC_SIZE = (LONGLONG)60 * 70 * FRAME_STRIDE; // ~22 GB
-
-static void enableManageVolumePrivilege()
-{
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
-        return;
-    LUID luid;
-    if (LookupPrivilegeValue(nullptr, SE_MANAGE_VOLUME_NAME, &luid))
-    {
-        TOKEN_PRIVILEGES tp{};
-        tp.PrivilegeCount           = 1;
-        tp.Privileges[0].Luid       = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-    }
-    CloseHandle(hToken);
-}
-
 // ── Folder + file creation ────────────────────────────────────────
 std::string createExperimentFolder()
 {
@@ -262,24 +235,11 @@ std::string createExperimentFolder()
         fs::create_directories(path);
         g_cameras[i].savePath = path;
 
-        // NO_BUFFERING: bypasses OS cache entirely — no dirty-page throttle stalls.
-        // SEQUENTIAL_SCAN: hints to OS prefetcher (has no effect with NO_BUFFERING,
-        // but harmless and useful if flags are ever changed).
         g_cameras[i].hFrames = CreateFileA(
             (path + "/frames.bin").c_str(),
             GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
-
-        // Pre-allocate the full recording space so WriteFile fills existing
-        // clusters rather than triggering NTFS cluster allocation on every call.
-        // SetFileValidData skips zero-filling (requires SeManageVolumePrivilege).
-        LARGE_INTEGER preLi; preLi.QuadPart = PREALLOC_SIZE;
-        SetFilePointerEx(g_cameras[i].hFrames, preLi, nullptr, FILE_BEGIN);
-        SetEndOfFile(g_cameras[i].hFrames);
-        SetFileValidData(g_cameras[i].hFrames, PREALLOC_SIZE);
-        preLi.QuadPart = 0;
-        SetFilePointerEx(g_cameras[i].hFrames, preLi, nullptr, FILE_BEGIN);
 
         g_cameras[i].batchBuf = static_cast<uint8_t*>(
             _aligned_malloc((size_t)BATCH_SIZE * FRAME_STRIDE, SECTOR));
@@ -336,7 +296,6 @@ int main()
 {
     try
     {
-        enableManageVolumePrivilege();
         IGXFactory::GetInstance().Init();
         std::cout << "SDK Initialized." << std::endl;
 
@@ -349,10 +308,6 @@ int main()
         std::cout << "Format: " << IMG_W << "x" << IMG_H
                   << " 8-bit mono, " << (FRAME_BYTES / 1024 / 1024.0)
                   << " MB/frame  stride=" << FRAME_STRIDE << " B" << std::endl;
-        std::cout << "Pre-allocated " << std::fixed << std::setprecision(1)
-                  << (PREALLOC_SIZE / 1e9) << " GB per camera ("
-                  << (PREALLOC_SIZE * 4 / 1e9) << " GB total)" << std::endl;
-
         for (int i = 0; i < 4; ++i)
             g_writerThreads[i] = std::thread(writerThreadFunc, i);
 
@@ -379,7 +334,7 @@ int main()
             if (i == 0)
             {
                 featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
-                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(35.0);
+                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(70.0);
                 configureMaster(featureControls[i]);
             }
             else
@@ -448,12 +403,6 @@ int main()
         {
             std::ofstream meta(g_cameras[i].savePath + "/metadata.txt", std::ios::app);
             meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
-
-            // Truncate file to actual recorded size (releases pre-allocated space)
-            LARGE_INTEGER actualSize;
-            actualSize.QuadPart = (LONGLONG)g_cameras[i].savedCount.load() * FRAME_STRIDE;
-            SetFilePointerEx(g_cameras[i].hFrames, actualSize, nullptr, FILE_BEGIN);
-            SetEndOfFile(g_cameras[i].hFrames);
 
             CloseHandle(g_cameras[i].hFrames);
             g_cameras[i].tsFile.close();
