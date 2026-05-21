@@ -334,7 +334,7 @@ int main()
             if (i == 0)
             {
                 featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
-                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(70.0);
+                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(35.0);
                 configureMaster(featureControls[i]);
             }
             else
