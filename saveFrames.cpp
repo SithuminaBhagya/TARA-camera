@@ -86,28 +86,24 @@ struct CameraState
 
 CameraState g_cameras[4];
 
-// ── One writer thread per camera — all four run concurrently ──────
-std::deque<FrameItem>    g_writeQueues[4];
-std::mutex               g_queueMtxs[4];
-std::condition_variable  g_queueCvs[4];
+// ── Single writer handles all cameras sequentially ────────────────
+std::deque<FrameItem>    g_writeQueue;
+std::mutex               g_queueMtx;
+std::condition_variable  g_queueCv;
 std::atomic<bool>        g_stopWriter{ false };
-std::thread              g_writerThreads[4];
+std::thread              g_writerThread;
 
-void writerThreadFunc(int ci)
+void writerThreadFunc()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    // Pin each writer to its own P-core pair (0-1, 2-3, 4-5, 6-7) away from USB E-cores 16-19
-    const ULONG_PTR masks[4] = { 0x03ULL, 0x0CULL, 0x30ULL, 0xC0ULL };
-    SetThreadAffinityMask(GetCurrentThread(), masks[ci]);
 
-    double totalWriteMs = 0.0;
-    double maxWriteMs   = 0.0;
-    int    writeCount   = 0;
+    double totalWriteMs[4] = {};
+    double maxWriteMs[4]   = {};
+    int    writeCount[4]   = {};
 
-    auto& cam = g_cameras[ci];
-
-    auto flushBatch = [&]()
+    auto flushBatch = [&](int ci)
     {
+        auto& cam = g_cameras[ci];
         if (cam.batchFillCount == 0) return;
 
         DWORD  written = 0;
@@ -117,9 +113,9 @@ void writerThreadFunc(int ci)
         double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
 
-        totalWriteMs += ms;
-        if (ms > maxWriteMs) maxWriteMs = ms;
-        writeCount++;
+        totalWriteMs[ci] += ms;
+        if (ms > maxWriteMs[ci]) maxWriteMs[ci] = ms;
+        writeCount[ci]++;
 
         for (int k = 0; k < cam.batchFillCount; ++k)
         {
@@ -135,15 +131,18 @@ void writerThreadFunc(int ci)
     {
         FrameItem item;
         {
-            std::unique_lock<std::mutex> lk(g_queueMtxs[ci]);
-            g_queueCvs[ci].wait(lk, [ci]{
-                return !g_writeQueues[ci].empty() || g_stopWriter.load();
+            std::unique_lock<std::mutex> lk(g_queueMtx);
+            g_queueCv.wait(lk, []{
+                return !g_writeQueue.empty() || g_stopWriter.load();
             });
-            if (g_writeQueues[ci].empty())
+            if (g_writeQueue.empty())
                 break;
-            item = g_writeQueues[ci].front();
-            g_writeQueues[ci].pop_front();
+            item = g_writeQueue.front();
+            g_writeQueue.pop_front();
         }
+
+        int   ci  = item.camIdx;
+        auto& cam = g_cameras[ci];
 
         memcpy(cam.batchBuf + (size_t)cam.batchFillCount * FRAME_STRIDE,
                cam.bufs[item.bufIdx], FRAME_BYTES);
@@ -156,22 +155,24 @@ void writerThreadFunc(int ci)
         }
 
         if (cam.batchFillCount == BATCH_SIZE)
-            flushBatch();
+            flushBatch(ci);
     }
 
-    flushBatch();  // partial batch at stop
-    FlushFileBuffers(cam.hFrames);
-    cam.tsFile.flush();
+    for (int i = 0; i < 4; ++i) flushBatch(i);
+    for (int i = 0; i < 4; ++i) { FlushFileBuffers(g_cameras[i].hFrames); g_cameras[i].tsFile.flush(); }
 
-    if (writeCount > 0)
+    for (int i = 0; i < 4; ++i)
     {
-        double avgMs   = totalWriteMs / writeCount;
-        double batchMB = (double)BATCH_SIZE * FRAME_STRIDE / 1024.0 / 1024.0;
-        double mbps    = batchMB / (avgMs / 1000.0);
-        std::cout << "  Cam" << (ci + 1) << " write: avg " << std::fixed
-                  << std::setprecision(2) << avgMs << " ms  max " << maxWriteMs
-                  << " ms  (" << (int)mbps << " MB/s)"
-                  << "  [" << BATCH_SIZE << " frames/write]" << std::endl;
+        if (writeCount[i] > 0)
+        {
+            double avgMs   = totalWriteMs[i] / writeCount[i];
+            double batchMB = (double)BATCH_SIZE * FRAME_STRIDE / 1024.0 / 1024.0;
+            double mbps    = batchMB / (avgMs / 1000.0);
+            std::cout << "  Cam" << (i + 1) << " write: avg " << std::fixed
+                      << std::setprecision(2) << avgMs << " ms  max " << maxWriteMs[i]
+                      << " ms  (" << (int)mbps << " MB/s)"
+                      << "  [" << BATCH_SIZE << " frames/write]" << std::endl;
+        }
     }
 }
 
@@ -212,12 +213,39 @@ public:
         memcpy(cam.bufs[bufIdx], pRaw8, FRAME_BYTES);
 
         {
-            std::lock_guard<std::mutex> lk(g_queueMtxs[m_index]);
-            g_writeQueues[m_index].push_back({ m_index, bufIdx, count, ts });
+            std::lock_guard<std::mutex> lk(g_queueMtx);
+            g_writeQueue.push_back({ m_index, bufIdx, count, ts });
         }
-        g_queueCvs[m_index].notify_one();
+        g_queueCv.notify_one();
     }
 };
+
+// ── Pre-allocation helpers ────────────────────────────────────────
+// Pre-allocating disk space before recording eliminates NTFS cluster-allocation
+// overhead (VCB lock contention) during WriteFile, so writes hit pre-existing
+// extents exactly like the disktest benchmark does.
+
+// 60 seconds × 70 fps per camera — adjust if longer recordings are needed.
+// Four cameras × 22 GB = 88 GB reserved on disk, released after recording.
+const LONGLONG PREALLOC_SIZE = (LONGLONG)60 * 70 * FRAME_STRIDE; // ~22 GB
+
+static void enableManageVolumePrivilege()
+{
+    HANDLE hToken;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return;
+    LUID luid;
+    if (LookupPrivilegeValue(nullptr, SE_MANAGE_VOLUME_NAME, &luid))
+    {
+        TOKEN_PRIVILEGES tp{};
+        tp.PrivilegeCount           = 1;
+        tp.Privileges[0].Luid       = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    }
+    CloseHandle(hToken);
+}
 
 // ── Folder + file creation ────────────────────────────────────────
 std::string createExperimentFolder()
@@ -247,6 +275,16 @@ std::string createExperimentFolder()
             GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
+
+        // Pre-allocate the full recording space so WriteFile fills existing
+        // clusters rather than triggering NTFS cluster allocation on every call.
+        // SetFileValidData skips zero-filling (requires SeManageVolumePrivilege).
+        LARGE_INTEGER preLi; preLi.QuadPart = PREALLOC_SIZE;
+        SetFilePointerEx(g_cameras[i].hFrames, preLi, nullptr, FILE_BEGIN);
+        SetEndOfFile(g_cameras[i].hFrames);
+        SetFileValidData(g_cameras[i].hFrames, PREALLOC_SIZE);
+        preLi.QuadPart = 0;
+        SetFilePointerEx(g_cameras[i].hFrames, preLi, nullptr, FILE_BEGIN);
 
         g_cameras[i].batchBuf = static_cast<uint8_t*>(
             _aligned_malloc((size_t)BATCH_SIZE * FRAME_STRIDE, SECTOR));
@@ -303,6 +341,7 @@ int main()
 {
     try
     {
+        enableManageVolumePrivilege();
         IGXFactory::GetInstance().Init();
         std::cout << "SDK Initialized." << std::endl;
 
@@ -315,9 +354,11 @@ int main()
         std::cout << "Format: " << IMG_W << "x" << IMG_H
                   << " 8-bit mono, " << (FRAME_BYTES / 1024 / 1024.0)
                   << " MB/frame  stride=" << FRAME_STRIDE << " B" << std::endl;
+        std::cout << "Pre-allocated " << std::fixed << std::setprecision(1)
+                  << (PREALLOC_SIZE / 1e9) << " GB per camera ("
+                  << (PREALLOC_SIZE * 4 / 1e9) << " GB total)" << std::endl;
 
-        for (int i = 0; i < 4; ++i)
-            g_writerThreads[i] = std::thread(writerThreadFunc, i);
+        g_writerThread = std::thread(writerThreadFunc);
 
         std::vector<CGXDevicePointer>                  cameras(4);
         std::vector<CGXStreamPointer>                  streams(4);
@@ -379,10 +420,10 @@ int main()
                     break;
             }
 
-            size_t qDepth = 0;
-            for (int i = 0; i < 4; ++i) {
-                std::lock_guard<std::mutex> lock(g_queueMtxs[i]);
-                qDepth += g_writeQueues[i].size();
+            size_t qDepth;
+            {
+                std::lock_guard<std::mutex> lock(g_queueMtx);
+                qDepth = g_writeQueue.size();
             }
             std::cout << "\r  Queue: " << qDepth << " pending  " << std::flush;
 
@@ -403,16 +444,23 @@ int main()
         }
 
         std::cout << "Flushing write queue (waiting for disk)..." << std::endl;
-        g_stopWriter.store(true);
-        for (int i = 0; i < 4; ++i)
-            g_queueCvs[i].notify_all();
-        for (int i = 0; i < 4; ++i)
-            g_writerThreads[i].join();
+        {
+            std::lock_guard<std::mutex> lock(g_queueMtx);
+            g_stopWriter.store(true);
+            g_queueCv.notify_one();
+        }
+        g_writerThread.join();
 
         for (int i = 0; i < 4; ++i)
         {
             std::ofstream meta(g_cameras[i].savePath + "/metadata.txt", std::ios::app);
             meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
+
+            // Truncate file to actual recorded size (releases pre-allocated space)
+            LARGE_INTEGER actualSize;
+            actualSize.QuadPart = (LONGLONG)g_cameras[i].savedCount.load() * FRAME_STRIDE;
+            SetFilePointerEx(g_cameras[i].hFrames, actualSize, nullptr, FILE_BEGIN);
+            SetEndOfFile(g_cameras[i].hFrames);
 
             CloseHandle(g_cameras[i].hFrames);
             g_cameras[i].tsFile.close();
