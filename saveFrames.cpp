@@ -35,7 +35,7 @@ const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 // Playback seeks by FRAME_STRIDE but reads only FRAME_BYTES valid pixels.
 const size_t SECTOR        = 4096;
 const size_t FRAME_STRIDE  = (FRAME_BYTES + SECTOR - 1) / SECTOR * SECTOR; // 5,619,712
-const int    BATCH_SIZE    = 32;   // frames per WriteFile call per camera
+const int    BATCH_SIZE    = 8;    // frames per WriteFile call per camera
 
 // ── Frame item passed from callback to writer thread ──────────────
 struct FrameItem
