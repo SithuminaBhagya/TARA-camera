@@ -35,7 +35,7 @@ const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 // Playback seeks by FRAME_STRIDE but reads only FRAME_BYTES valid pixels.
 const size_t SECTOR        = 4096;
 const size_t FRAME_STRIDE  = (FRAME_BYTES + SECTOR - 1) / SECTOR * SECTOR; // 5,619,712
-const int    BATCH_SIZE    = 15;   // frames per WriteFile call per camera (~1 sec at 15fps)
+const int    BATCH_SIZE    = 10;   // frames per WriteFile call per camera (~1 sec at 10fps)
 
 // ── Frame item passed from callback to writer thread ──────────────
 struct FrameItem
@@ -75,9 +75,9 @@ struct CameraState
     int       batchFillCount{ 0 };
     FrameItem batchItems[BATCH_SIZE];   // metadata for frames waiting in batchBuf
 
-    // 128 frames × 5.6 MB = ~718 MB per camera (~2.9 GB total for 4 cameras).
-    // Needs to cover worst-case WriteFile duration (max ~2.4s × 70fps = 168 frames).
-    static const int MAX_QUEUE_DEPTH = 128;
+    // 256 frames × 5.6 MB = ~1.44 GB per camera (~5.8 GB total for 4 cameras).
+    // Covers worst-case 17s OS write stall at 15fps (15 × 11 = 165 frames per camera observed max).
+    static const int MAX_QUEUE_DEPTH = 256;
 
     CameraState() = default;
     CameraState(const CameraState&) = delete;
