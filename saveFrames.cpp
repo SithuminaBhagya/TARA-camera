@@ -35,7 +35,7 @@ const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 // Playback seeks by FRAME_STRIDE but reads only FRAME_BYTES valid pixels.
 const size_t SECTOR        = 4096;
 const size_t FRAME_STRIDE  = (FRAME_BYTES + SECTOR - 1) / SECTOR * SECTOR; // 5,619,712
-const int    BATCH_SIZE    = 10;   // frames per WriteFile call per camera (~1 sec at 10fps)
+const int    BATCH_SIZE    = 10;   // frames per WriteFile call per camera (0.67 s at 15 fps)
 
 // ── Frame item passed from callback to writer thread ──────────────
 struct FrameItem
@@ -243,7 +243,7 @@ std::string createExperimentFolder()
         g_cameras[i].hFrames = CreateFileA(
             (path + "/frames.bin").c_str(),
             GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
 
         g_cameras[i].batchBuf = static_cast<uint8_t*>(
