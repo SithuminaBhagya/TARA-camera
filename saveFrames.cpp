@@ -39,6 +39,7 @@ const size_t FRAME_STRIDE  = (FRAME_BYTES + SECTOR - 1) / SECTOR * SECTOR; // 5,
 // ── Frame item passed from callback to writer thread ──────────────
 struct FrameItem
 {
+    int      camIdx;
     int      bufIdx;      // index into CameraState::bufs / matPool
     int      frameIndex;
     uint64_t timestamp;
@@ -62,16 +63,11 @@ struct CameraState
     // Pre-allocated, sector-aligned frame buffer pool.
     // bufs[i]    — raw 4096-aligned pointer used for WriteFile and memcpy
     // matPool[i] — cv::Mat header pointing into bufs[i] (does not own memory)
-    // freeBufs   — indices of buffers currently not in writeQueue
+    // freeBufs   — indices of buffers not currently in the global write queue
     std::vector<uint8_t*> bufs;
     std::vector<cv::Mat>  matPool;
     std::vector<int>      freeBufs;
-
-    std::queue<FrameItem>    writeQueue;
-    std::mutex               queueMtx;
-    std::condition_variable  queueCv;
-    std::atomic<bool>        stopWriter{ false };
-    std::thread              writerThread;
+    std::mutex            freeBufsMtx;
 
     // 48 frames × 5.6 MB = ~268 MB per camera.
     static const int MAX_QUEUE_DEPTH = 48;
@@ -83,67 +79,85 @@ struct CameraState
 
 CameraState g_cameras[4];
 
-// ── Writer thread — one per camera ───────────────────────────────
-void writerThreadFunc(int camIdx)
+// ── Single global writer — one thread handles all cameras ─────────
+// Four concurrent writer threads were serialized by the Windows I/O
+// Manager, multiplying ~1 ms NVMe writes into ~120 ms stalls.
+std::queue<FrameItem>    g_writeQueue;
+std::mutex               g_queueMtx;
+std::condition_variable  g_queueCv;
+std::atomic<bool>        g_stopWriter{ false };
+std::thread              g_writerThread;
+
+void writerThreadFunc()
 {
-    auto& cam = g_cameras[camIdx];
-    int    lastBufIdx   = -1;
-    double totalWriteMs = 0.0;
-    double maxWriteMs   = 0.0;
+    int    lastCamIdx      = -1;
+    int    lastBufIdx      = -1;
+    double totalWriteMs[4] = {};
+    double maxWriteMs[4]   = {};
 
     while (true)
     {
         FrameItem item;
         {
-            std::unique_lock<std::mutex> lock(cam.queueMtx);
-            if (lastBufIdx >= 0)
-            {
-                cam.freeBufs.push_back(lastBufIdx);
-                lastBufIdx = -1;
-            }
-            cam.queueCv.wait(lock, [&]{
-                return !cam.writeQueue.empty() || cam.stopWriter.load();
+            std::unique_lock<std::mutex> lock(g_queueMtx);
+            g_queueCv.wait(lock, []{
+                return !g_writeQueue.empty() || g_stopWriter.load();
             });
 
-            if (cam.writeQueue.empty())
+            if (g_writeQueue.empty())
                 break;
 
-            item = cam.writeQueue.front();
-            cam.writeQueue.pop();
+            item = g_writeQueue.front();
+            g_writeQueue.pop();
         }
 
+        // Return previous buffer now that we've claimed the next item
+        if (lastBufIdx >= 0)
+        {
+            std::lock_guard<std::mutex> lk(g_cameras[lastCamIdx].freeBufsMtx);
+            g_cameras[lastCamIdx].freeBufs.push_back(lastBufIdx);
+        }
+
+        auto& cam = g_cameras[item.camIdx];
         DWORD written;
         auto  t0 = std::chrono::steady_clock::now();
         WriteFile(cam.hFrames, cam.bufs[item.bufIdx],
                   (DWORD)FRAME_STRIDE, &written, nullptr);
         double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
-        totalWriteMs += ms;
-        if (ms > maxWriteMs) maxWriteMs = ms;
+        totalWriteMs[item.camIdx] += ms;
+        if (ms > maxWriteMs[item.camIdx]) maxWriteMs[item.camIdx] = ms;
 
         int savedIdx = cam.savedCount.fetch_add(1);
         cam.tsFile << savedIdx << "," << item.frameIndex << "," << item.timestamp << "\n";
 
+        lastCamIdx = item.camIdx;
         lastBufIdx = item.bufIdx;
     }
 
     if (lastBufIdx >= 0)
     {
-        std::lock_guard<std::mutex> lock(cam.queueMtx);
-        cam.freeBufs.push_back(lastBufIdx);
+        std::lock_guard<std::mutex> lk(g_cameras[lastCamIdx].freeBufsMtx);
+        g_cameras[lastCamIdx].freeBufs.push_back(lastBufIdx);
     }
 
-    FlushFileBuffers(cam.hFrames);
-    cam.tsFile.flush();
-
-    int saved = cam.savedCount.load();
-    if (saved > 0)
+    for (int i = 0; i < 4; ++i)
     {
-        double avgMs = totalWriteMs / saved;
-        double mbps  = (FRAME_STRIDE / 1024.0 / 1024.0) / (avgMs / 1000.0);
-        std::cout << "  Cam" << (camIdx + 1) << " write: avg " << std::fixed
-                  << std::setprecision(2) << avgMs << " ms  max " << maxWriteMs
-                  << " ms  (" << (int)mbps << " MB/s)" << std::endl;
+        FlushFileBuffers(g_cameras[i].hFrames);
+        g_cameras[i].tsFile.flush();
+    }
+
+    for (int i = 0; i < 4; ++i)
+    {
+        int saved = g_cameras[i].savedCount.load();
+        if (saved > 0)
+        {
+            double avgMs = totalWriteMs[i] / saved;
+            double mbps  = (FRAME_STRIDE / 1024.0 / 1024.0) / (avgMs / 1000.0);
+            std::cout << "  Cam" << (i + 1) << " write: avg " << std::fixed
+                      << std::setprecision(2) << avgMs << " ms  max " << maxWriteMs[i]
+                      << " ms  (" << (int)mbps << " MB/s)" << std::endl;
+        }
     }
 }
 
@@ -165,21 +179,29 @@ public:
         auto& cam   = g_cameras[m_index];
         int   count = cam.frameCount.fetch_add(1);
 
+        int bufIdx = -1;
         {
-            std::lock_guard<std::mutex> lock(cam.queueMtx);
+            std::lock_guard<std::mutex> lk(cam.freeBufsMtx);
             if (!cam.freeBufs.empty())
             {
-                int idx = cam.freeBufs.back();
+                bufIdx = cam.freeBufs.back();
                 cam.freeBufs.pop_back();
-                memcpy(cam.bufs[idx], pRaw8, FRAME_BYTES);
-                cam.writeQueue.push({ idx, count, ts });
-                cam.queueCv.notify_one();
-            }
-            else
-            {
-                cam.droppedCount.fetch_add(1);
             }
         }
+
+        if (bufIdx < 0)
+        {
+            cam.droppedCount.fetch_add(1);
+            return;
+        }
+
+        memcpy(cam.bufs[bufIdx], pRaw8, FRAME_BYTES);
+
+        {
+            std::lock_guard<std::mutex> lk(g_queueMtx);
+            g_writeQueue.push({ m_index, bufIdx, count, ts });
+        }
+        g_queueCv.notify_one();
     }
 };
 
@@ -276,8 +298,7 @@ int main()
                   << " 8-bit mono, " << (FRAME_BYTES / 1024 / 1024.0)
                   << " MB/frame  stride=" << FRAME_STRIDE << " B" << std::endl;
 
-        for (int i = 0; i < 4; ++i)
-            g_cameras[i].writerThread = std::thread(writerThreadFunc, i);
+        g_writerThread = std::thread(writerThreadFunc);
 
         std::vector<CGXDevicePointer>                  cameras(4);
         std::vector<CGXStreamPointer>                  streams(4);
@@ -339,13 +360,12 @@ int main()
                     break;
             }
 
-            std::cout << "\r  Queue: ";
-            for (int i = 0; i < 4; ++i)
+            size_t qDepth;
             {
-                std::lock_guard<std::mutex> lock(g_cameras[i].queueMtx);
-                std::cout << "Cam" << (i + 1) << "=" << g_cameras[i].writeQueue.size() << "  ";
+                std::lock_guard<std::mutex> lock(g_queueMtx);
+                qDepth = g_writeQueue.size();
             }
-            std::cout << std::flush;
+            std::cout << "\r  Queue: " << qDepth << " pending  " << std::flush;
 
             Sleep(500);
         }
@@ -363,16 +383,16 @@ int main()
             cameras[i]->Close();
         }
 
-        std::cout << "Flushing write queues (waiting for disk)..." << std::endl;
+        std::cout << "Flushing write queue (waiting for disk)..." << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(g_queueMtx);
+            g_stopWriter.store(true);
+            g_queueCv.notify_one();
+        }
+        g_writerThread.join();
+
         for (int i = 0; i < 4; ++i)
         {
-            {
-                std::lock_guard<std::mutex> lock(g_cameras[i].queueMtx);
-                g_cameras[i].stopWriter.store(true);
-                g_cameras[i].queueCv.notify_one();
-            }
-            g_cameras[i].writerThread.join();
-
             std::ofstream meta(g_cameras[i].savePath + "/metadata.txt", std::ios::app);
             meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
 
