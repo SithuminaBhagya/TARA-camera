@@ -11,6 +11,7 @@
 #include <thread>
 #include <cmath>
 #include <numeric>
+#include <cstdint>
 
 namespace fs = std::filesystem;
 
@@ -18,7 +19,7 @@ namespace fs = std::filesystem;
 const std::string SAVE_ROOT = "recordings";
 const int         DISPLAY_W = 800;
 const int         DISPLAY_H = 667;
-const int         FPS       = 70;
+const int         FPS       = 15;
 const int         IMG_W     = 2600;
 const int         IMG_H     = 2160;
 const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
@@ -30,49 +31,86 @@ const std::vector<std::string> CAM_LABELS = {
     "Cam 4  P2  slave  10013"
 };
 
-// ── Read frame stride from metadata.txt (falls back to FRAME_BYTES for old recordings) ──
-size_t getFrameStride(const std::string& camFolder)
+// ── Metadata: format, frame_stride, frames ────────────────────────
+struct CamMeta
 {
+    std::string format       = "raw";  // "raw" (old) or "png"
+    size_t      frameStride  = FRAME_BYTES;
+    int         frameCount   = 0;
+};
+
+CamMeta loadMeta(const std::string& camFolder)
+{
+    CamMeta m;
     std::ifstream meta(camFolder + "/metadata.txt");
-    if (meta.is_open())
+    if (!meta.is_open()) return m;
+
+    std::string line;
+    while (std::getline(meta, line))
     {
-        std::string line;
-        while (std::getline(meta, line))
-        {
-            if (line.substr(0, 13) == "frame_stride=")
-                return std::stoull(line.substr(13));
-        }
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq);
+        std::string v = line.substr(eq + 1);
+        if      (k == "format")       m.format      = v;
+        else if (k == "frame_stride") m.frameStride = std::stoull(v);
+        else if (k == "frames")       m.frameCount  = std::stoi(v);
     }
-    return FRAME_BYTES; // old experiments had no padding
+    return m;
 }
 
-// ── Read frame count from metadata.txt ───────────────────────────
-int getFrameCount(const std::string& camFolder)
+int getFrameCountFallback(const std::string& camFolder)
 {
-    std::ifstream meta(camFolder + "/metadata.txt");
-    if (meta.is_open())
-    {
-        std::string line;
-        while (std::getline(meta, line))
-        {
-            if (line.substr(0, 7) == "frames=")
-                return std::stoi(line.substr(7));
-        }
-    }
-    // Fallback: count rows in timestamps.csv (minus header)
     std::ifstream ts(camFolder + "/timestamps.csv");
-    if (ts.is_open())
-    {
-        int count = -1;
-        std::string line;
-        while (std::getline(ts, line)) ++count;
-        return std::max(0, count);
-    }
-    return 0;
+    if (!ts.is_open()) return 0;
+    int count = -1;
+    std::string line;
+    while (std::getline(ts, line)) ++count;
+    return std::max(0, count);
 }
 
-// ── Load a single frame from frames.bin by index ─────────────────
-cv::Mat loadFrame(const std::string& camFolder, int frameIdx, size_t stride)
+// ── PNG offset table: scan frames.bin once, record byte offset of each frame ──
+// File layout: [u32 size][PNG bytes] [u32 size][PNG bytes] ...
+std::vector<uint64_t> buildPngOffsets(const std::string& camFolder)
+{
+    std::vector<uint64_t> offsets;
+    std::ifstream f(camFolder + "/frames.bin", std::ios::binary);
+    if (!f.is_open()) return offsets;
+
+    uint64_t pos = 0;
+    while (true)
+    {
+        uint32_t size = 0;
+        f.read(reinterpret_cast<char*>(&size), sizeof(size));
+        if (!f || size == 0) break;
+        offsets.push_back(pos);
+        pos += sizeof(size) + size;
+        f.seekg(pos);
+        if (!f) break;
+    }
+    return offsets;
+}
+
+// ── Load a single PNG-compressed frame ───────────────────────────
+cv::Mat loadFramePng(const std::string& camFolder, uint64_t offset)
+{
+    std::ifstream f(camFolder + "/frames.bin", std::ios::binary);
+    if (!f.is_open()) return {};
+
+    f.seekg((std::streamoff)offset);
+    uint32_t size = 0;
+    f.read(reinterpret_cast<char*>(&size), sizeof(size));
+    if (!f || size == 0) return {};
+
+    std::vector<uchar> buf(size);
+    f.read(reinterpret_cast<char*>(buf.data()), size);
+    if (!f) return {};
+
+    return cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
+}
+
+// ── Load a single raw frame (legacy format) ──────────────────────
+cv::Mat loadFrameRaw(const std::string& camFolder, int frameIdx, size_t stride)
 {
     std::ifstream f(camFolder + "/frames.bin", std::ios::binary);
     if (!f.is_open()) return {};
@@ -87,16 +125,14 @@ cv::Mat loadFrame(const std::string& camFolder, int frameIdx, size_t stride)
     return gray;
 }
 
-// ── Load timestamps from CSV ──────────────────────────────────────
-// CSV format: saved_index,frame_index,timestamp_ticks
-// Assumes 1 tick = 1 ns (1 GHz camera clock).
+// ── Load timestamps from CSV (saved_index,frame_index,timestamp_ticks) ──
 std::vector<uint64_t> loadTimestamps(const std::string& camFolder)
 {
     std::vector<uint64_t> ts;
     std::ifstream f(camFolder + "/timestamps.csv");
     if (!f.is_open()) return ts;
     std::string line;
-    std::getline(f, line); // skip header
+    std::getline(f, line); // header
     while (std::getline(f, line))
     {
         auto c1 = line.find(',');
@@ -251,19 +287,33 @@ int main()
         expPath + "/camera_4"
     };
 
-    std::vector<std::vector<uint64_t>> allTimestamps(4);
-    std::vector<int>                   frameCounts(4, 0);
-    std::vector<size_t>                frameStrides(4, FRAME_BYTES);
+    std::vector<CamMeta>                 metas(4);
+    std::vector<std::vector<uint64_t>>   allTimestamps(4);
+    std::vector<std::vector<uint64_t>>   pngOffsets(4);
+    std::vector<int>                     frameCounts(4, 0);
     int maxFrames = 0;
 
     for (int i = 0; i < 4; ++i)
     {
-        frameCounts[i]   = getFrameCount(camFolders[i]);
-        frameStrides[i]  = getFrameStride(camFolders[i]);
+        metas[i] = loadMeta(camFolders[i]);
+
+        if (metas[i].format == "png")
+        {
+            pngOffsets[i] = buildPngOffsets(camFolders[i]);
+            frameCounts[i] = (int)pngOffsets[i].size();
+        }
+        else
+        {
+            frameCounts[i] = metas[i].frameCount > 0
+                ? metas[i].frameCount
+                : getFrameCountFallback(camFolders[i]);
+        }
+
         allTimestamps[i] = loadTimestamps(camFolders[i]);
         maxFrames        = std::max(maxFrames, frameCounts[i]);
         std::cout << "Camera " << (i + 1) << ": " << frameCounts[i] << " frames  "
-                  << allTimestamps[i].size() << " timestamps" << std::endl;
+                  << allTimestamps[i].size() << " timestamps  ("
+                  << metas[i].format << ")" << std::endl;
     }
 
     if (maxFrames == 0)
@@ -292,8 +342,11 @@ int main()
             std::vector<cv::Mat> frames(4);
             for (int i = 0; i < 4; ++i)
             {
-                if (frameIdx < frameCounts[i])
-                    frames[i] = loadFrame(camFolders[i], frameIdx, frameStrides[i]);
+                if (frameIdx >= frameCounts[i]) continue;
+                if (metas[i].format == "png")
+                    frames[i] = loadFramePng(camFolders[i], pngOffsets[i][frameIdx]);
+                else
+                    frames[i] = loadFrameRaw(camFolders[i], frameIdx, metas[i].frameStride);
             }
 
             cv::Mat grid = buildGrid(frames, frameIdx, maxFrames);
