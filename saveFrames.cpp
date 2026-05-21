@@ -98,6 +98,7 @@ std::thread              g_writerThread;
 void writerThreadFunc()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadAffinityMask(GetCurrentThread(), 0xFF); // P-cores 0-7, away from USB E-cores 16-19
 
     double totalWriteMs[4] = {};
     double maxWriteMs[4]   = {};
@@ -352,7 +353,7 @@ int main()
             if (i == 0)
             {
                 featureControls[i]->GetEnumFeature("AcquisitionFrameRateMode")->SetValue("On");
-                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(70.0);
+                featureControls[i]->GetFloatFeature("AcquisitionFrameRate")->SetValue(35.0);
                 configureMaster(featureControls[i]);
             }
             else
