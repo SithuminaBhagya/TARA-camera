@@ -17,10 +17,10 @@ namespace fs = std::filesystem;
 
 // ── Config ────────────────────────────────────────────────────────
 const std::string SAVE_ROOT = "recordings";
-const int         DISPLAY_W   = 800;
-const int         DISPLAY_H   = 667;
-const double      FALLBACK_FPS = 10.0;   // used if metadata has no fps field
-const int         IMG_W       = 2600;
+const int         DISPLAY_W    = 800;
+const int         DISPLAY_H    = 667;
+const double      PLAYBACK_FPS = 30.0;   // hardcoded: real-time speed for 30 fps captures
+const int         IMG_W        = 2600;
 const int         IMG_H     = 2160;
 const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 
@@ -392,25 +392,92 @@ int main()
 
     printSyncStats(allTimestamps, frameCounts);
 
-    // Real-time playback: use the recorded fps from metadata so playback
-    // duration matches the original capture duration.  Pick the highest fps
-    // across cameras (they should all agree); fall back to FALLBACK_FPS if
-    // metadata is missing the field (older recordings).
-    double playbackFps = 0.0;
+    // ── Pre-decode all frames into memory ────────────────────────────
+    // Storing at display resolution as grayscale (1 byte/pixel) keeps memory
+    // small enough to fit easily; cvtColor to BGR happens during playback.
+    // Memory: 4 cams * maxFrames * DISPLAY_W * DISPLAY_H bytes
+    //       ≈ 4 * 605 * 800 * 667 ≈ 1.3 GB for a 20-second 30 fps recording.
+    std::vector<std::vector<cv::Mat>> decoded(4);
     for (int i = 0; i < 4; ++i)
-        if (metas[i].fps > playbackFps) playbackFps = metas[i].fps;
-    if (playbackFps <= 0.0) playbackFps = FALLBACK_FPS;
+        decoded[i].resize(frameCounts[i]);
 
-    std::cout << "Playback at " << playbackFps << " fps (real time)" << std::endl;
+    int totalWork = 0;
+    for (int i = 0; i < 4; ++i) totalWork += frameCounts[i];
+
+    std::cout << "Pre-decoding " << totalWork << " frames..." << std::endl;
+    auto decodeStart = std::chrono::steady_clock::now();
+
+    std::atomic<int> nextWork{ 0 };
+    std::atomic<int> doneCount{ 0 };
+
+    const int N_DECODE_THREADS = 16;
+    std::vector<std::thread> decoders;
+    decoders.reserve(N_DECODE_THREADS);
+
+    for (int t = 0; t < N_DECODE_THREADS; ++t)
+    {
+        decoders.emplace_back([&]() {
+            while (true)
+            {
+                int idx = nextWork.fetch_add(1);
+                if (idx >= totalWork) break;
+
+                // Map flat index → (camera, frame)
+                int cam = 0, frame = idx;
+                for (int c = 0; c < 4; ++c)
+                {
+                    if (frame < frameCounts[c]) { cam = c; break; }
+                    frame -= frameCounts[c];
+                }
+
+                cv::Mat full;
+                if (metas[cam].format == "png" && frame < (int)pngOffsets[cam].size())
+                    full = loadFramePng(camFolders[cam], pngOffsets[cam][frame]);
+                else if (metas[cam].format == "raw" && metas[cam].framesPerChunk > 0)
+                    full = loadFrameRawChunked(camFolders[cam], frame,
+                                               metas[cam].frameStride,
+                                               metas[cam].framesPerChunk);
+                else if (metas[cam].format != "png")
+                    full = loadFrameRaw(camFolders[cam], frame, metas[cam].frameStride);
+
+                if (!full.empty())
+                {
+                    cv::Mat small;
+                    cv::resize(full, small, { DISPLAY_W, DISPLAY_H });
+                    decoded[cam][frame] = small;
+                }
+
+                int done = doneCount.fetch_add(1) + 1;
+                if (done % 50 == 0 || done == totalWork)
+                {
+                    std::cout << "\r  " << done << " / " << totalWork
+                              << " (" << (done * 100 / totalWork) << "%)"
+                              << std::flush;
+                }
+            }
+        });
+    }
+
+    for (auto& t : decoders) t.join();
+
+    double decodeSec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - decodeStart).count();
+    std::cout << "\r  Decoded " << totalWork << " frames in "
+              << std::fixed << std::setprecision(2) << decodeSec << " sec  ("
+              << (int)(totalWork / decodeSec) << " fps decode rate)" << std::endl;
+
+    std::cout << "\nPlayback at " << PLAYBACK_FPS
+              << " fps (real-time, every frame shown)" << std::endl;
     std::cout << "Controls: SPACE = pause/resume | Q = quit\n" << std::endl;
 
     cv::namedWindow("Playback", cv::WINDOW_NORMAL);
     cv::resizeWindow("Playback", DISPLAY_W * 2, DISPLAY_H * 2);
 
+    bool paused = false;
+
     int  frameIdx      = 0;
-    bool paused        = false;
     auto frameDuration = std::chrono::microseconds(
-        (long long)(1000000.0 / playbackFps));
+        (long long)(1000000.0 / PLAYBACK_FPS));
 
     while (true)
     {
@@ -418,19 +485,11 @@ int main()
 
         if (!paused)
         {
+            // All frames are already decoded — just assemble the grid and show.
             std::vector<cv::Mat> frames(4);
             for (int i = 0; i < 4; ++i)
-            {
-                if (frameIdx >= frameCounts[i]) continue;
-                if (metas[i].format == "png" && frameIdx < (int)pngOffsets[i].size())
-                    frames[i] = loadFramePng(camFolders[i], pngOffsets[i][frameIdx]);
-                else if (metas[i].format == "raw" && metas[i].framesPerChunk > 0)
-                    frames[i] = loadFrameRawChunked(camFolders[i], frameIdx,
-                                                    metas[i].frameStride,
-                                                    metas[i].framesPerChunk);
-                else if (metas[i].format != "png")
-                    frames[i] = loadFrameRaw(camFolders[i], frameIdx, metas[i].frameStride);
-            }
+                if (frameIdx < (int)decoded[i].size())
+                    frames[i] = decoded[i][frameIdx];
 
             cv::Mat grid = buildGrid(frames, frameIdx, maxFrames);
             cv::imshow("Playback", grid);
@@ -449,6 +508,9 @@ int main()
         if (cv::getWindowProperty("Playback", cv::WND_PROP_VISIBLE) < 1)
             break;
 
+        // Sleep just enough to maintain the real-time pace.  Because every
+        // frame is pre-decoded, the per-iteration work is cheap (just a few
+        // ms for cvtColor + concat + imshow), so we sleep most of the budget.
         auto elapsed   = std::chrono::steady_clock::now() - frameStart;
         auto sleepTime = frameDuration - elapsed;
         if (sleepTime > std::chrono::microseconds(0))
