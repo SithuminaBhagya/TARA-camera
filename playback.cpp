@@ -17,10 +17,10 @@ namespace fs = std::filesystem;
 
 // ── Config ────────────────────────────────────────────────────────
 const std::string SAVE_ROOT = "recordings";
-const int         DISPLAY_W = 800;
-const int         DISPLAY_H = 667;
-const int         FPS       = 10;
-const int         IMG_W     = 2600;
+const int         DISPLAY_W   = 800;
+const int         DISPLAY_H   = 667;
+const double      FALLBACK_FPS = 10.0;   // used if metadata has no fps field
+const int         IMG_W       = 2600;
 const int         IMG_H     = 2160;
 const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 
@@ -38,6 +38,7 @@ struct CamMeta
     size_t      frameStride    = FRAME_BYTES;
     int         frameCount     = 0;
     int         framesPerChunk = 0;      // 0 => single frames.bin (legacy)
+    double      fps            = 0.0;    // 0 => not specified in metadata
 };
 
 CamMeta loadMeta(const std::string& camFolder)
@@ -57,6 +58,7 @@ CamMeta loadMeta(const std::string& camFolder)
         else if (k == "frame_stride")      m.frameStride    = std::stoull(v);
         else if (k == "frames")            m.frameCount     = std::stoi(v);
         else if (k == "frames_per_chunk")  m.framesPerChunk = std::stoi(v);
+        else if (k == "fps")               m.fps            = std::stod(v);
     }
     return m;
 }
@@ -390,6 +392,16 @@ int main()
 
     printSyncStats(allTimestamps, frameCounts);
 
+    // Real-time playback: use the recorded fps from metadata so playback
+    // duration matches the original capture duration.  Pick the highest fps
+    // across cameras (they should all agree); fall back to FALLBACK_FPS if
+    // metadata is missing the field (older recordings).
+    double playbackFps = 0.0;
+    for (int i = 0; i < 4; ++i)
+        if (metas[i].fps > playbackFps) playbackFps = metas[i].fps;
+    if (playbackFps <= 0.0) playbackFps = FALLBACK_FPS;
+
+    std::cout << "Playback at " << playbackFps << " fps (real time)" << std::endl;
     std::cout << "Controls: SPACE = pause/resume | Q = quit\n" << std::endl;
 
     cv::namedWindow("Playback", cv::WINDOW_NORMAL);
@@ -397,7 +409,8 @@ int main()
 
     int  frameIdx      = 0;
     bool paused        = false;
-    auto frameDuration = std::chrono::microseconds(1000000 / FPS);
+    auto frameDuration = std::chrono::microseconds(
+        (long long)(1000000.0 / playbackFps));
 
     while (true)
     {
