@@ -29,11 +29,18 @@ const std::vector<std::string> CAM_SNS = {
 const std::string SAVE_ROOT  = "recordings";
 const int         IMG_W      = 2600;
 const int         IMG_H      = 2160;
-const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
+const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;            // 5,616,000
 
-// Test configuration: 30 fps Mono8 raw for 20 seconds.
-// Combined data rate = 4 * 30 * 5.36 MB = ~643 MB/s.
-// Total data = ~12.9 GB, fits comfortably in the SLC cache window.
+// FILE_FLAG_NO_BUFFERING requires write sizes and buffer addresses to be
+// multiples of the disk sector size (4096 bytes on NVMe).  Pad the frame
+// from 5,616,000 → 5,619,712 bytes (next 4 KiB boundary).  The trailing
+// 3,712 bytes are unused padding; playback reads only FRAME_BYTES per frame.
+const size_t      SECTOR_BYTES = 4096;
+const size_t      FRAME_STRIDE = ((FRAME_BYTES + SECTOR_BYTES - 1) / SECTOR_BYTES) * SECTOR_BYTES;
+
+// Test configuration: 30 fps Mono8 raw for 20 seconds with NO_BUFFERING.
+// Bypasses Windows page cache so writes go straight to the SSD — should let
+// the SLC cache absorb the full burst at multi-GB/s.
 const double CAPTURE_FPS   = 30.0;
 const int    RECORD_SECONDS = 20;
 
@@ -111,14 +118,15 @@ void writerThreadFunc()
 
         DWORD written = 0;
         auto t0 = std::chrono::steady_clock::now();
+        // NO_BUFFERING write: must be sector-aligned and sector-multiple sized.
         WriteFile(cam.hFrames, cam.bufs[item.bufIdx],
-                  (DWORD)FRAME_BYTES, &written, nullptr);
+                  (DWORD)FRAME_STRIDE, &written, nullptr);
         double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
 
         totalWriteMs[ci] += ms;
         if (ms > maxWriteMs[ci]) maxWriteMs[ci] = ms;
-        totalBytes[ci] += FRAME_BYTES;
+        totalBytes[ci] += FRAME_STRIDE;
         writeCount[ci]++;
 
         int savedIdx = cam.savedCount.fetch_add(1);
@@ -219,37 +227,41 @@ std::string createExperimentFolder()
         fs::create_directories(path);
         g_cameras[i].savePath = path;
 
-        // Single growing frames.bin per camera — buffered writes.
-        // No chunk rotation: we expect 12.9 GB total to fit in the SLC cache
-        // window so the OS page cache and disk shouldn't bottleneck.
+        // Single growing frames.bin per camera with NO_BUFFERING.  Writes
+        // bypass the Windows page cache and go straight to the NVMe driver,
+        // avoiding the dirty-page accumulation that stalled the buffered run.
         g_cameras[i].hFrames = CreateFileA(
             (path + "/frames.bin").c_str(),
             GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
 
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
         g_cameras[i].tsFile << "saved_index,frame_index,timestamp_ticks\n";
 
-        // Raw frame buffer pool
+        // Raw frame buffer pool — 4 KiB aligned, FRAME_STRIDE bytes each (with
+        // padding past the image data) so each buffer can be passed directly
+        // to a NO_BUFFERING WriteFile call.
         g_cameras[i].bufs.reserve(CameraState::MAX_QUEUE_DEPTH);
         for (int j = 0; j < CameraState::MAX_QUEUE_DEPTH; ++j)
         {
-            auto* buf = static_cast<uint8_t*>(malloc(FRAME_BYTES));
+            auto* buf = static_cast<uint8_t*>(_aligned_malloc(FRAME_STRIDE, SECTOR_BYTES));
+            // Zero the trailing padding once so the bytes on disk are deterministic.
+            memset(buf + FRAME_BYTES, 0, FRAME_STRIDE - FRAME_BYTES);
             g_cameras[i].bufs.push_back(buf);
             g_cameras[i].freeBufs.push_back(j);
         }
 
-        // Metadata: format=raw with fixed FRAME_BYTES stride.
-        // Compatible with playback.cpp's existing raw mode.
+        // Metadata: format=raw with FRAME_STRIDE (padded) so playback can seek
+        // by stride and read only FRAME_BYTES of actual pixel data per frame.
         std::ofstream meta(path + "/metadata.txt");
-        meta << "width="        << IMG_W       << "\n"
-             << "height="       << IMG_H       << "\n"
+        meta << "width="        << IMG_W        << "\n"
+             << "height="       << IMG_H        << "\n"
              << "channels=1\n"
              << "dtype=uint8\n"
              << "format=raw\n"
-             << "frame_stride=" << FRAME_BYTES << "\n"
-             << "fps="          << CAPTURE_FPS << "\n";
+             << "frame_stride=" << FRAME_STRIDE << "\n"
+             << "fps="          << CAPTURE_FPS  << "\n";
     }
 
     return expPath;
@@ -410,7 +422,7 @@ int main()
             meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
 
             for (auto* buf : g_cameras[i].bufs)
-                free(buf);
+                _aligned_free(buf);
             g_cameras[i].bufs.clear();
         }
 
