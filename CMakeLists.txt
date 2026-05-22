@@ -26,7 +26,6 @@ target_link_libraries(CamDetails
 add_executable(SaveFrames saveFrames.cpp)
 target_link_libraries(SaveFrames
     GxIAPICPPEx
-    opencv_world4120
 )
 
 add_executable(Playback playback.cpp)
