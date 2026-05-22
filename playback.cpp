@@ -31,12 +31,13 @@ const std::vector<std::string> CAM_LABELS = {
     "Cam 4  P2  slave  10013"
 };
 
-// ── Metadata: format, frame_stride, frames ────────────────────────
+// ── Metadata: format, frame_stride, frames, frames_per_chunk ──────
 struct CamMeta
 {
-    std::string format       = "raw";  // "raw" (old) or "png"
-    size_t      frameStride  = FRAME_BYTES;
-    int         frameCount   = 0;
+    std::string format         = "raw";  // "raw" (old/new) or "png"
+    size_t      frameStride    = FRAME_BYTES;
+    int         frameCount     = 0;
+    int         framesPerChunk = 0;      // 0 => single frames.bin (legacy)
 };
 
 CamMeta loadMeta(const std::string& camFolder)
@@ -52,9 +53,10 @@ CamMeta loadMeta(const std::string& camFolder)
         if (eq == std::string::npos) continue;
         std::string k = line.substr(0, eq);
         std::string v = line.substr(eq + 1);
-        if      (k == "format")       m.format      = v;
-        else if (k == "frame_stride") m.frameStride = std::stoull(v);
-        else if (k == "frames")       m.frameCount  = std::stoi(v);
+        if      (k == "format")            m.format         = v;
+        else if (k == "frame_stride")      m.frameStride    = std::stoull(v);
+        else if (k == "frames")            m.frameCount     = std::stoi(v);
+        else if (k == "frames_per_chunk")  m.framesPerChunk = std::stoi(v);
     }
     return m;
 }
@@ -153,13 +155,33 @@ cv::Mat loadFramePng(const std::string& camFolder, const FrameLoc& loc)
     return cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
 }
 
-// ── Load a single raw frame (legacy format) ──────────────────────
+// ── Load a single raw frame (legacy single-file format) ─────────
 cv::Mat loadFrameRaw(const std::string& camFolder, int frameIdx, size_t stride)
 {
     std::ifstream f(camFolder + "/frames.bin", std::ios::binary);
     if (!f.is_open()) return {};
 
     f.seekg((std::streamoff)frameIdx * (std::streamoff)stride);
+    if (!f) return {};
+
+    cv::Mat gray(IMG_H, IMG_W, CV_8UC1);
+    f.read(reinterpret_cast<char*>(gray.data), FRAME_BYTES);
+    if (!f) return {};
+
+    return gray;
+}
+
+// ── Load a single raw frame from a chunked recording ────────────
+cv::Mat loadFrameRawChunked(const std::string& camFolder, int frameIdx,
+                             size_t stride, int framesPerChunk)
+{
+    int chunkIdx     = frameIdx / framesPerChunk;
+    int frameInChunk = frameIdx % framesPerChunk;
+
+    std::ifstream f(chunkFilename(camFolder, chunkIdx), std::ios::binary);
+    if (!f.is_open()) return {};
+
+    f.seekg((std::streamoff)frameInChunk * (std::streamoff)stride);
     if (!f) return {};
 
     cv::Mat gray(IMG_H, IMG_W, CV_8UC1);
@@ -389,6 +411,10 @@ int main()
                 if (frameIdx >= frameCounts[i]) continue;
                 if (metas[i].format == "png" && frameIdx < (int)pngOffsets[i].size())
                     frames[i] = loadFramePng(camFolders[i], pngOffsets[i][frameIdx]);
+                else if (metas[i].format == "raw" && metas[i].framesPerChunk > 0)
+                    frames[i] = loadFrameRawChunked(camFolders[i], frameIdx,
+                                                    metas[i].frameStride,
+                                                    metas[i].framesPerChunk);
                 else if (metas[i].format != "png")
                     frames[i] = loadFrameRaw(camFolders[i], frameIdx, metas[i].frameStride);
             }

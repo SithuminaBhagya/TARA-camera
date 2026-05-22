@@ -38,11 +38,12 @@ const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;            // 5,616,000
 const size_t      SECTOR_BYTES = 4096;
 const size_t      FRAME_STRIDE = ((FRAME_BYTES + SECTOR_BYTES - 1) / SECTOR_BYTES) * SECTOR_BYTES;
 
-// Test configuration: 30 fps Mono8 raw for 20 seconds with NO_BUFFERING.
-// Bypasses Windows page cache so writes go straight to the SSD — should let
-// the SLC cache absorb the full burst at multi-GB/s.
-const double CAPTURE_FPS   = 30.0;
-const int    RECORD_SECONDS = 20;
+// Test configuration: 30 fps Mono8 raw for 20 seconds with NO_BUFFERING
+// + chunk rotation.  NO_BUFFERING bypasses the OS page cache.  Chunk rotation
+// keeps individual files small and provides a periodic file-close checkpoint.
+const double CAPTURE_FPS     = 30.0;
+const int    RECORD_SECONDS  = 20;
+const int    FRAMES_PER_CHUNK = 100;   // ~3.3 sec per chunk at 30 fps
 
 // ── Item passed from callback to writer thread ─────────────────────
 struct WriteItem
@@ -63,6 +64,10 @@ struct CameraState
 
     HANDLE        hFrames{ INVALID_HANDLE_VALUE };
     std::ofstream tsFile;
+
+    // Chunk rotation state — owned by writer thread, no locking needed.
+    int currentChunkIndex   { 0 };
+    int framesInCurrentChunk{ 0 };
 
     // Raw frame buffer pool — FRAME_BYTES each.
     // Callback grabs a free bufIdx, memcpy's raw pixels in.
@@ -88,6 +93,29 @@ std::mutex                 g_queueMtx;
 std::condition_variable    g_queueCv;
 std::atomic<bool>          g_stopWriter{ false };
 std::thread                g_writerThread;
+
+// Background close threads — CloseHandle on a NO_BUFFERING file may still
+// take a few ms.  Offload it so the writer keeps moving.
+std::vector<std::thread>   g_closeThreads;
+std::mutex                 g_closeThreadsMtx;
+
+// ── Chunk filename helpers ────────────────────────────────────────
+std::string chunkPath(const std::string& camFolder, int chunkIdx)
+{
+    std::ostringstream ss;
+    ss << camFolder << "/chunk_"
+       << std::setw(3) << std::setfill('0') << chunkIdx << ".bin";
+    return ss.str();
+}
+
+HANDLE openChunkFile(int camIdx, int chunkIdx)
+{
+    return CreateFileA(
+        chunkPath(g_cameras[camIdx].savePath, chunkIdx).c_str(),
+        GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr);
+}
 
 // ── Single writer thread — fixed-size raw writes ──────────────────
 void writerThreadFunc()
@@ -138,6 +166,19 @@ void writerThreadFunc()
         {
             std::lock_guard<std::mutex> lk(cam.freeBufsMtx);
             cam.freeBufs.push_back(item.bufIdx);
+        }
+
+        // ── Rotate chunk if full ──────────────────────────────────
+        cam.framesInCurrentChunk++;
+        if (cam.framesInCurrentChunk >= FRAMES_PER_CHUNK)
+        {
+            HANDLE oldHandle = cam.hFrames;
+            cam.currentChunkIndex++;
+            cam.framesInCurrentChunk = 0;
+            cam.hFrames = openChunkFile(ci, cam.currentChunkIndex);
+
+            std::lock_guard<std::mutex> lk(g_closeThreadsMtx);
+            g_closeThreads.emplace_back([oldHandle]() { CloseHandle(oldHandle); });
         }
     }
 
@@ -227,14 +268,11 @@ std::string createExperimentFolder()
         fs::create_directories(path);
         g_cameras[i].savePath = path;
 
-        // Single growing frames.bin per camera with NO_BUFFERING.  Writes
-        // bypass the Windows page cache and go straight to the NVMe driver,
-        // avoiding the dirty-page accumulation that stalled the buffered run.
-        g_cameras[i].hFrames = CreateFileA(
-            (path + "/frames.bin").c_str(),
-            GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
-            nullptr);
+        // Chunked NO_BUFFERING recording: writes go straight to disk and
+        // each chunk caps file size at FRAMES_PER_CHUNK * FRAME_STRIDE.
+        g_cameras[i].currentChunkIndex    = 0;
+        g_cameras[i].framesInCurrentChunk = 0;
+        g_cameras[i].hFrames = openChunkFile(i, 0);
 
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
         g_cameras[i].tsFile << "saved_index,frame_index,timestamp_ticks\n";
@@ -252,16 +290,16 @@ std::string createExperimentFolder()
             g_cameras[i].freeBufs.push_back(j);
         }
 
-        // Metadata: format=raw with FRAME_STRIDE (padded) so playback can seek
-        // by stride and read only FRAME_BYTES of actual pixel data per frame.
+        // Metadata: chunked raw with FRAME_STRIDE (padded) per frame.
         std::ofstream meta(path + "/metadata.txt");
-        meta << "width="        << IMG_W        << "\n"
-             << "height="       << IMG_H        << "\n"
+        meta << "width="            << IMG_W            << "\n"
+             << "height="           << IMG_H            << "\n"
              << "channels=1\n"
              << "dtype=uint8\n"
              << "format=raw\n"
-             << "frame_stride=" << FRAME_STRIDE << "\n"
-             << "fps="          << CAPTURE_FPS  << "\n";
+             << "frame_stride="     << FRAME_STRIDE     << "\n"
+             << "frames_per_chunk=" << FRAMES_PER_CHUNK << "\n"
+             << "fps="              << CAPTURE_FPS      << "\n";
     }
 
     return expPath;
@@ -415,16 +453,24 @@ int main()
 
         for (int i = 0; i < 4; ++i)
         {
+            // Close the final (partial) chunk
             CloseHandle(g_cameras[i].hFrames);
             g_cameras[i].tsFile.close();
 
             std::ofstream meta(g_cameras[i].savePath + "/metadata.txt", std::ios::app);
-            meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
+            meta << "frames=" << g_cameras[i].savedCount.load()     << "\n"
+                 << "chunks=" << (g_cameras[i].currentChunkIndex + 1) << "\n";
 
             for (auto* buf : g_cameras[i].bufs)
                 _aligned_free(buf);
             g_cameras[i].bufs.clear();
         }
+
+        std::cout << "Waiting for background flushes (" << g_closeThreads.size()
+                  << " chunks)..." << std::endl;
+        for (auto& t : g_closeThreads)
+            if (t.joinable()) t.join();
+        g_closeThreads.clear();
 
         IGXFactory::GetInstance().Uninit();
 
