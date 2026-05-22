@@ -1,5 +1,4 @@
 #include "GalaxyIncludes.h"
-#include <opencv2/opencv.hpp>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -12,6 +11,7 @@
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
+#include <chrono>
 #include <conio.h>
 #include <malloc.h>
 #include <cstdint>
@@ -31,33 +31,19 @@ const int         IMG_W      = 2600;
 const int         IMG_H      = 2160;
 const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 
-// PNG compression level: 1 = fastest (worst ratio), 9 = slowest (best ratio).
-// Level 1 typical: ~50-100 ms/frame, ratio ~1.5-2x for natural images.
-const int PNG_COMPRESSION_LEVEL = 1;
+// Test configuration: 30 fps Mono8 raw for 20 seconds.
+// Combined data rate = 4 * 30 * 5.36 MB = ~643 MB/s.
+// Total data = ~12.9 GB, fits comfortably in the SLC cache window.
+const double CAPTURE_FPS   = 30.0;
+const int    RECORD_SECONDS = 20;
 
-// File rotation: each camera's recording is split into chunks of FRAMES_PER_CHUNK
-// frames. Closing a chunk forces a flush to disk, preventing dirty pages from
-// piling up to the threshold that triggers Windows' multi-second write-stall.
-// 100 frames at 10 fps = 10 seconds per chunk.
-const int FRAMES_PER_CHUNK = 100;
-const double CAPTURE_FPS    = 10.0;
-
-// ── Item passed from callback to per-camera compression thread ─────
-struct FrameItem
+// ── Item passed from callback to writer thread ─────────────────────
+struct WriteItem
 {
     int      camIdx;
     int      bufIdx;
     int      frameIndex;
     uint64_t timestamp;
-};
-
-// ── Item passed from compression thread to global writer ───────────
-struct CompressedItem
-{
-    int                camIdx;
-    int                frameIndex;
-    uint64_t           timestamp;
-    std::vector<uchar> data;        // PNG-encoded bytes
 };
 
 // ── Per-camera state ──────────────────────────────────────────────
@@ -71,25 +57,15 @@ struct CameraState
     HANDLE        hFrames{ INVALID_HANDLE_VALUE };
     std::ofstream tsFile;
 
-    // Chunk rotation state — owned by writer thread, no locking needed
-    int currentChunkIndex   { 0 };
-    int framesInCurrentChunk{ 0 };
-
-    // Raw frame buffer pool — uncompressed FRAME_BYTES each.
+    // Raw frame buffer pool — FRAME_BYTES each.
     // Callback grabs a free bufIdx, memcpy's raw pixels in.
-    // Compression thread reads from bufs[bufIdx], then returns bufIdx to freeBufs.
+    // Writer reads from bufs[bufIdx], then returns bufIdx to freeBufs.
     std::vector<uint8_t*> bufs;
     std::vector<int>      freeBufs;
     std::mutex            freeBufsMtx;
 
-    // Per-camera compression queue (raw frames waiting to be encoded).
-    std::deque<FrameItem>    compressQueue;
-    std::mutex               compressMtx;
-    std::condition_variable  compressCv;
-    std::thread              compressThread;
-
-    // 128 frames × 5.4 MB raw = ~690 MB per camera (~2.8 GB total for 4 cameras).
-    // Compression keeps up with cameras; this is just a small absorption buffer.
+    // 128 buffers × 5.36 MB = ~686 MB per camera (~2.7 GB total).
+    // Absorption buffer if writer momentarily lags behind capture.
     static const int MAX_QUEUE_DEPTH = 128;
 
     CameraState() = default;
@@ -99,109 +75,14 @@ struct CameraState
 
 CameraState g_cameras[4];
 
-// ── Global write queue (compressed frames from all cameras) ────────
-std::deque<CompressedItem>  g_writeQueue;
-std::mutex                  g_queueMtx;
-std::condition_variable     g_queueCv;
-std::atomic<bool>           g_stopWriter{ false };
-std::atomic<bool>           g_stopCompress{ false };
-std::thread                 g_writerThread;
+// ── Global write queue (raw frames from all cameras, interleaved) ──
+std::deque<WriteItem>      g_writeQueue;
+std::mutex                 g_queueMtx;
+std::condition_variable    g_queueCv;
+std::atomic<bool>          g_stopWriter{ false };
+std::thread                g_writerThread;
 
-// Background close threads — each closes one rotated-out chunk file.
-// CloseHandle blocks until dirty pages flush, so we offload it to avoid
-// stalling the writer.
-std::vector<std::thread>    g_closeThreads;
-std::mutex                  g_closeThreadsMtx;
-
-// ── Chunk filename helper ─────────────────────────────────────────
-std::string chunkPath(const std::string& camFolder, int chunkIdx)
-{
-    std::ostringstream ss;
-    ss << camFolder << "/chunk_"
-       << std::setw(3) << std::setfill('0') << chunkIdx << ".bin";
-    return ss.str();
-}
-
-HANDLE openChunkFile(int camIdx, int chunkIdx)
-{
-    return CreateFileA(
-        chunkPath(g_cameras[camIdx].savePath, chunkIdx).c_str(),
-        GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-        nullptr);
-}
-
-// ── Per-camera compression thread ──────────────────────────────────
-void compressionThreadFunc(int camIdx)
-{
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    auto& cam = g_cameras[camIdx];
-
-    std::vector<int> pngParams = { cv::IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION_LEVEL };
-
-    double totalCompMs = 0.0;
-    double maxCompMs   = 0.0;
-    size_t totalBytes  = 0;
-    int    compCount   = 0;
-
-    while (true)
-    {
-        FrameItem item;
-        {
-            std::unique_lock<std::mutex> lk(cam.compressMtx);
-            cam.compressCv.wait(lk, [&] {
-                return !cam.compressQueue.empty() || g_stopCompress.load();
-            });
-            if (cam.compressQueue.empty())
-                break;
-            item = cam.compressQueue.front();
-            cam.compressQueue.pop_front();
-        }
-
-        // Wrap raw buffer in cv::Mat header (no copy)
-        cv::Mat raw(IMG_H, IMG_W, CV_8UC1, cam.bufs[item.bufIdx]);
-
-        CompressedItem out;
-        out.camIdx     = item.camIdx;
-        out.frameIndex = item.frameIndex;
-        out.timestamp  = item.timestamp;
-
-        auto t0 = std::chrono::steady_clock::now();
-        cv::imencode(".png", raw, out.data, pngParams);
-        double ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - t0).count();
-        totalCompMs += ms;
-        if (ms > maxCompMs) maxCompMs = ms;
-        totalBytes += out.data.size();
-        compCount++;
-
-        // Release raw buffer back to camera's free pool
-        {
-            std::lock_guard<std::mutex> lk(cam.freeBufsMtx);
-            cam.freeBufs.push_back(item.bufIdx);
-        }
-
-        // Hand compressed frame to the writer
-        {
-            std::lock_guard<std::mutex> lk(g_queueMtx);
-            g_writeQueue.push_back(std::move(out));
-        }
-        g_queueCv.notify_one();
-    }
-
-    if (compCount > 0)
-    {
-        double avgMs = totalCompMs / compCount;
-        double avgKB = (double)totalBytes / compCount / 1024.0;
-        double ratio = (double)FRAME_BYTES / ((double)totalBytes / compCount);
-        std::cout << "  Cam" << (camIdx + 1) << " compress: avg " << std::fixed
-                  << std::setprecision(2) << avgMs << " ms  max " << maxCompMs
-                  << " ms  avg " << std::setprecision(1) << avgKB << " KB/frame  "
-                  << std::setprecision(2) << ratio << "x ratio" << std::endl;
-    }
-}
-
-// ── Single writer thread — variable-size compressed writes ──────────
+// ── Single writer thread — fixed-size raw writes ──────────────────
 void writerThreadFunc()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -213,7 +94,7 @@ void writerThreadFunc()
 
     while (true)
     {
-        CompressedItem item;
+        WriteItem item;
         {
             std::unique_lock<std::mutex> lk(g_queueMtx);
             g_queueCv.wait(lk, [] {
@@ -221,25 +102,23 @@ void writerThreadFunc()
             });
             if (g_writeQueue.empty())
                 break;
-            item = std::move(g_writeQueue.front());
+            item = g_writeQueue.front();
             g_writeQueue.pop_front();
         }
 
         int   ci  = item.camIdx;
         auto& cam = g_cameras[ci];
 
-        uint32_t size = (uint32_t)item.data.size();
-        DWORD    written = 0;
-
+        DWORD written = 0;
         auto t0 = std::chrono::steady_clock::now();
-        WriteFile(cam.hFrames, &size, sizeof(size), &written, nullptr);
-        WriteFile(cam.hFrames, item.data.data(), size, &written, nullptr);
+        WriteFile(cam.hFrames, cam.bufs[item.bufIdx],
+                  (DWORD)FRAME_BYTES, &written, nullptr);
         double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
 
         totalWriteMs[ci] += ms;
         if (ms > maxWriteMs[ci]) maxWriteMs[ci] = ms;
-        totalBytes[ci] += size + sizeof(size);
+        totalBytes[ci] += FRAME_BYTES;
         writeCount[ci]++;
 
         int savedIdx = cam.savedCount.fetch_add(1);
@@ -247,19 +126,10 @@ void writerThreadFunc()
                    << item.frameIndex << ","
                    << item.timestamp  << "\n";
 
-        // ── Rotate chunk if full ──────────────────────────────────
-        cam.framesInCurrentChunk++;
-        if (cam.framesInCurrentChunk >= FRAMES_PER_CHUNK)
+        // Release buffer back to camera's free pool
         {
-            HANDLE oldHandle = cam.hFrames;
-            cam.currentChunkIndex++;
-            cam.framesInCurrentChunk = 0;
-            cam.hFrames = openChunkFile(ci, cam.currentChunkIndex);
-
-            // Close old handle in background so the writer thread isn't blocked
-            // waiting for the OS to flush dirty pages.
-            std::lock_guard<std::mutex> lk(g_closeThreadsMtx);
-            g_closeThreads.emplace_back([oldHandle]() { CloseHandle(oldHandle); });
+            std::lock_guard<std::mutex> lk(cam.freeBufsMtx);
+            cam.freeBufs.push_back(item.bufIdx);
         }
     }
 
@@ -269,15 +139,17 @@ void writerThreadFunc()
         g_cameras[i].tsFile.flush();
     }
 
+    std::cout << "\nWrite statistics:" << std::endl;
     for (int i = 0; i < 4; ++i)
     {
         if (writeCount[i] > 0)
         {
             double avgMs   = totalWriteMs[i] / writeCount[i];
             double totalMB = (double)totalBytes[i] / 1024.0 / 1024.0;
-            std::cout << "  Cam" << (i + 1) << " write:    avg " << std::fixed
-                      << std::setprecision(2) << avgMs << " ms  max " << maxWriteMs[i]
-                      << " ms  total " << std::setprecision(1) << totalMB << " MB" << std::endl;
+            std::cout << "  Cam" << (i + 1) << " write: avg " << std::fixed
+                      << std::setprecision(2) << avgMs << " ms  max "
+                      << maxWriteMs[i] << " ms  total "
+                      << std::setprecision(1) << totalMB << " MB" << std::endl;
         }
     }
 }
@@ -318,11 +190,12 @@ public:
 
         memcpy(cam.bufs[bufIdx], pRaw8, FRAME_BYTES);
 
+        // Push directly to global write queue (no compression stage)
         {
-            std::lock_guard<std::mutex> lk(cam.compressMtx);
-            cam.compressQueue.push_back({ m_index, bufIdx, count, ts });
+            std::lock_guard<std::mutex> lk(g_queueMtx);
+            g_writeQueue.push_back({ m_index, bufIdx, count, ts });
         }
-        cam.compressCv.notify_one();
+        g_queueCv.notify_one();
     }
 };
 
@@ -346,17 +219,19 @@ std::string createExperimentFolder()
         fs::create_directories(path);
         g_cameras[i].savePath = path;
 
-        // Buffered writes with periodic chunk rotation — each closed chunk
-        // forces a flush, preventing dirty pages from accumulating to the
-        // threshold that triggers Windows' multi-second write-stall.
-        g_cameras[i].currentChunkIndex    = 0;
-        g_cameras[i].framesInCurrentChunk = 0;
-        g_cameras[i].hFrames = openChunkFile(i, 0);
+        // Single growing frames.bin per camera — buffered writes.
+        // No chunk rotation: we expect 12.9 GB total to fit in the SLC cache
+        // window so the OS page cache and disk shouldn't bottleneck.
+        g_cameras[i].hFrames = CreateFileA(
+            (path + "/frames.bin").c_str(),
+            GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
 
         g_cameras[i].tsFile.open(path + "/timestamps.csv");
         g_cameras[i].tsFile << "saved_index,frame_index,timestamp_ticks\n";
 
-        // Raw frame buffer pool — plain malloc, no alignment needed for PNG path
+        // Raw frame buffer pool
         g_cameras[i].bufs.reserve(CameraState::MAX_QUEUE_DEPTH);
         for (int j = 0; j < CameraState::MAX_QUEUE_DEPTH; ++j)
         {
@@ -365,16 +240,16 @@ std::string createExperimentFolder()
             g_cameras[i].freeBufs.push_back(j);
         }
 
-        // Metadata: format=png signals variable-size [u32 size][data] records
-        // split across chunk_NNN.bin files (FRAMES_PER_CHUNK frames each)
+        // Metadata: format=raw with fixed FRAME_BYTES stride.
+        // Compatible with playback.cpp's existing raw mode.
         std::ofstream meta(path + "/metadata.txt");
-        meta << "width="    << IMG_W << "\n"
-             << "height="   << IMG_H << "\n"
+        meta << "width="        << IMG_W       << "\n"
+             << "height="       << IMG_H       << "\n"
              << "channels=1\n"
              << "dtype=uint8\n"
-             << "format=png\n"
-             << "png_level="        << PNG_COMPRESSION_LEVEL << "\n"
-             << "frames_per_chunk=" << FRAMES_PER_CHUNK      << "\n";
+             << "format=raw\n"
+             << "frame_stride=" << FRAME_BYTES << "\n"
+             << "fps="          << CAPTURE_FPS << "\n";
     }
 
     return expPath;
@@ -412,14 +287,14 @@ int main()
 
         std::string expPath = createExperimentFolder();
         std::cout << "Saving to: " << expPath << std::endl;
-        std::cout << "Format: " << IMG_W << "x" << IMG_H
-                  << " 8-bit mono, " << (FRAME_BYTES / 1024 / 1024.0)
-                  << " MB/frame raw  →  PNG level " << PNG_COMPRESSION_LEVEL << std::endl;
+        std::cout << "Mode: " << IMG_W << "x" << IMG_H << " 8-bit mono RAW @ "
+                  << CAPTURE_FPS << " fps for " << RECORD_SECONDS << " sec" << std::endl;
+        std::cout << "Expected: " << (4 * CAPTURE_FPS * FRAME_BYTES / 1024.0 / 1024.0)
+                  << " MB/s combined, "
+                  << (4 * CAPTURE_FPS * FRAME_BYTES * RECORD_SECONDS / 1024.0 / 1024.0 / 1024.0)
+                  << " GB total\n" << std::endl;
 
-        // Start writer first, then compression threads
         g_writerThread = std::thread(writerThreadFunc);
-        for (int i = 0; i < 4; ++i)
-            g_cameras[i].compressThread = std::thread(compressionThreadFunc, i);
 
         std::vector<CGXDevicePointer>                  cameras(4);
         std::vector<CGXStreamPointer>                  streams(4);
@@ -469,8 +344,10 @@ int main()
         }
 
         featureControls[0]->GetCommandFeature("AcquisitionStart")->Execute();
+        auto recordStart = std::chrono::steady_clock::now();
         std::cout << "Camera 1 started.\n" << std::endl;
-        std::cout << "Recording... Press Q to stop.\n" << std::endl;
+        std::cout << "Recording... (auto-stops at " << RECORD_SECONDS
+                  << " sec, or press Q to stop early)\n" << std::endl;
 
         while (true)
         {
@@ -481,23 +358,26 @@ int main()
                     break;
             }
 
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - recordStart).count();
+            if (elapsed >= RECORD_SECONDS * 1000)
+                break;
+
             size_t writeQ;
-            size_t compQ[4];
             {
                 std::lock_guard<std::mutex> lock(g_queueMtx);
                 writeQ = g_writeQueue.size();
             }
-            for (int i = 0; i < 4; ++i)
-            {
-                std::lock_guard<std::mutex> lk(g_cameras[i].compressMtx);
-                compQ[i] = g_cameras[i].compressQueue.size();
-            }
-            std::cout << "\r  Compress: ["
-                      << compQ[0] << "/" << compQ[1] << "/"
-                      << compQ[2] << "/" << compQ[3] << "]   Write: "
-                      << writeQ << "          " << std::flush;
+            std::cout << "\r  t=" << std::fixed << std::setprecision(1)
+                      << (elapsed / 1000.0) << "s  Write queue: " << writeQ
+                      << "  saved: ["
+                      << g_cameras[0].savedCount.load() << "/"
+                      << g_cameras[1].savedCount.load() << "/"
+                      << g_cameras[2].savedCount.load() << "/"
+                      << g_cameras[3].savedCount.load() << "]      "
+                      << std::flush;
 
-            Sleep(500);
+            Sleep(200);
         }
 
         std::cout << "\n\nStopping acquisition..." << std::endl;
@@ -513,14 +393,6 @@ int main()
             cameras[i]->Close();
         }
 
-        std::cout << "Draining compression queues..." << std::endl;
-        g_stopCompress.store(true);
-        for (int i = 0; i < 4; ++i)
-        {
-            g_cameras[i].compressCv.notify_one();
-            g_cameras[i].compressThread.join();
-        }
-
         std::cout << "Flushing write queue (waiting for disk)..." << std::endl;
         {
             std::lock_guard<std::mutex> lock(g_queueMtx);
@@ -531,25 +403,16 @@ int main()
 
         for (int i = 0; i < 4; ++i)
         {
-            // Close the final (partial) chunk
             CloseHandle(g_cameras[i].hFrames);
             g_cameras[i].tsFile.close();
 
             std::ofstream meta(g_cameras[i].savePath + "/metadata.txt", std::ios::app);
-            meta << "frames="    << g_cameras[i].savedCount.load()      << "\n"
-                 << "chunks="    << (g_cameras[i].currentChunkIndex + 1) << "\n";
+            meta << "frames=" << g_cameras[i].savedCount.load() << "\n";
 
             for (auto* buf : g_cameras[i].bufs)
                 free(buf);
             g_cameras[i].bufs.clear();
         }
-
-        // Wait for all background chunk-close threads to finish flushing
-        std::cout << "Waiting for background flushes (" << g_closeThreads.size()
-                  << " chunks)..." << std::endl;
-        for (auto& t : g_closeThreads)
-            if (t.joinable()) t.join();
-        g_closeThreads.clear();
 
         IGXFactory::GetInstance().Uninit();
 
