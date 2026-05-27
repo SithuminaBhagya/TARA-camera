@@ -1,5 +1,5 @@
 #include "GalaxyIncludes.h"
-#include <opencv2/opencv.hpp>
+#include <zstd.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -17,9 +17,11 @@
 #include <conio.h>
 #include <malloc.h>
 #include <cstdint>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
+// index 0 = master (Camera 1), indices 1-3 = slaves (Cameras 2-4)
 const std::vector<std::string> CAM_SNS = {
     "JCK26010021",  // Camera 1 — master
     "JCK26010020",  // Camera 2 — slave
@@ -32,17 +34,17 @@ const int         IMG_W      = 2600;
 const int         IMG_H      = 2160;
 const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
 
-// Test configuration: 30 fps Mono8 PNG for 20 seconds.
-// PNG encode at ~73 ms/frame = ~13.7 fps per thread.  With N threads per
-// camera, total PNG throughput per camera = N * 13.7 fps.  For 30 fps we
-// need N>=3; use 4 for safety margin.  Frames may complete out of order
-// across the N threads, so the writer maintains a per-camera reorder
-// buffer keyed by frame index.
-const int    PNG_COMPRESSION_LEVEL     = 1;
-const int    FRAMES_PER_CHUNK          = 100;     // ~3.3 sec per chunk at 30 fps
-const int    COMPRESS_THREADS_PER_CAM  = 4;
-const double CAPTURE_FPS               = 30.0;
-const int    RECORD_SECONDS            = 20;
+// Test configuration: 70 fps Mono8 with Zstd compression for 100 seconds.
+//
+// Compression budget per Zstd-1 benchmarks: ~10-15 ms per frame, so
+// 2 compress threads/cam × ~67 fps/thread ≈ 133 fps per camera capacity
+// vs 70 fps demand → ~90% headroom.  16 PNG threads worth of work
+// is replaced with 8 Zstd threads.
+const int    ZSTD_COMPRESSION_LEVEL    = 1;
+const int    FRAMES_PER_CHUNK          = 200;     // ~2.9 sec per chunk at 70 fps
+const int    COMPRESS_THREADS_PER_CAM  = 2;
+const double CAPTURE_FPS               = 70.0;
+const int    RECORD_SECONDS            = 100;
 
 // ── Item passed from callback to per-camera compression thread ─────
 struct FrameItem
@@ -59,13 +61,13 @@ struct CompressedItem
     int                camIdx;
     int                frameIndex;
     uint64_t           timestamp;
-    std::vector<uchar> data;        // PNG-encoded bytes
+    std::vector<uint8_t> data;       // Zstd-compressed bytes
 };
 
 // ── Per-camera state ──────────────────────────────────────────────
 struct CameraState
 {
-    std::atomic<int>  frameCount  { 0 };   // assigned after buffer grab (contiguous)
+    std::atomic<int>  frameCount  { 0 };   // assigned after buffer grab
     std::atomic<int>  savedCount  { 0 };
     std::atomic<int>  droppedCount{ 0 };
     std::string       savePath;
@@ -73,7 +75,7 @@ struct CameraState
     HANDLE        hFrames{ INVALID_HANDLE_VALUE };
     std::ofstream tsFile;
 
-    // Chunk rotation state — owned by writer thread, no locking needed.
+    // Chunk rotation state (writer thread only)
     int currentChunkIndex   { 0 };
     int framesInCurrentChunk{ 0 };
 
@@ -82,22 +84,22 @@ struct CameraState
     std::vector<int>      freeBufs;
     std::mutex            freeBufsMtx;
 
-    // Per-camera compression queue (multiple worker threads drain it).
+    // Per-camera compression queue (workers drain it)
     std::deque<FrameItem>     compressQueue;
     std::mutex                compressMtx;
     std::condition_variable   compressCv;
     std::vector<std::thread>  compressThreads;
 
-    // Per-camera compression stats (atomic — many writers).
-    std::atomic<int64_t>      totalCompressUs   { 0 };  // µs across threads
+    // Per-camera compression stats (atomic — many writers)
+    std::atomic<int64_t>      totalCompressUs   { 0 };
     std::atomic<int>          compressedCount   { 0 };
     std::atomic<int64_t>      totalCompressBytes{ 0 };
     std::mutex                maxCompressMtx;
     double                    maxCompressMs     { 0.0 };
 
-    // Writer-side reorder buffer.  Frames may arrive out of order from the
-    // N compress threads; we stash future frames here and only write them
-    // when their predecessor has been written.
+    // Writer-side reorder buffer (multiple compress threads can complete
+    // frames out of order; writer holds future frames until predecessors
+    // arrive, then drains in order).
     std::map<int, CompressedItem> reorderBuf;
     int                            nextExpectedFrameIdx{ 0 };
 
@@ -118,7 +120,7 @@ std::atomic<bool>           g_stopWriter{ false };
 std::atomic<bool>           g_stopCompress{ false };
 std::thread                 g_writerThread;
 
-// Background close threads
+// Background close threads (offload CloseHandle, which can stall on flush)
 std::vector<std::thread>    g_closeThreads;
 std::mutex                  g_closeThreadsMtx;
 
@@ -146,7 +148,14 @@ void compressionThreadFunc(int camIdx)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     auto& cam = g_cameras[camIdx];
 
-    std::vector<int> pngParams = { cv::IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION_LEVEL };
+    // Per-thread Zstd context — reused across all frames this thread handles.
+    // Avoids per-frame allocation/init overhead.
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, ZSTD_COMPRESSION_LEVEL);
+
+    // Worst-case output buffer size for one frame
+    const size_t bound = ZSTD_compressBound(FRAME_BYTES);
+    std::vector<uint8_t> outBuf(bound);
 
     while (true)
     {
@@ -162,45 +171,59 @@ void compressionThreadFunc(int camIdx)
             cam.compressQueue.pop_front();
         }
 
-        cv::Mat raw(IMG_H, IMG_W, CV_8UC1, cam.bufs[item.bufIdx]);
+        auto t0 = std::chrono::steady_clock::now();
+        size_t compressedSize = ZSTD_compress2(cctx,
+            outBuf.data(), bound,
+            cam.bufs[item.bufIdx], FRAME_BYTES);
+        auto dur = std::chrono::steady_clock::now() - t0;
+
+        if (ZSTD_isError(compressedSize))
+        {
+            // Compression failure — extremely unlikely with stock Zstd,
+            // but treat the frame as dropped if it happens.
+            cam.droppedCount.fetch_add(1);
+            {
+                std::lock_guard<std::mutex> lk(cam.freeBufsMtx);
+                cam.freeBufs.push_back(item.bufIdx);
+            }
+            continue;
+        }
+
+        int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(dur).count();
+        double  ms = us / 1000.0;
 
         CompressedItem out;
         out.camIdx     = item.camIdx;
         out.frameIndex = item.frameIndex;
         out.timestamp  = item.timestamp;
+        out.data.assign(outBuf.begin(), outBuf.begin() + compressedSize);
 
-        auto t0 = std::chrono::steady_clock::now();
-        cv::imencode(".png", raw, out.data, pngParams);
-        auto dur = std::chrono::steady_clock::now() - t0;
-        int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(dur).count();
-        double  ms = us / 1000.0;
-
-        // Aggregate per-camera stats
         cam.totalCompressUs.fetch_add(us);
         cam.compressedCount.fetch_add(1);
-        cam.totalCompressBytes.fetch_add((int64_t)out.data.size());
+        cam.totalCompressBytes.fetch_add((int64_t)compressedSize);
         {
             std::lock_guard<std::mutex> lk(cam.maxCompressMtx);
             if (ms > cam.maxCompressMs) cam.maxCompressMs = ms;
         }
 
-        // Return the raw buffer for reuse by the camera callback
+        // Return raw buffer to camera's free pool
         {
             std::lock_guard<std::mutex> lk(cam.freeBufsMtx);
             cam.freeBufs.push_back(item.bufIdx);
         }
 
-        // Hand the compressed frame to the writer
+        // Hand compressed frame to the writer
         {
             std::lock_guard<std::mutex> lk(g_queueMtx);
             g_writeQueue.push_back(std::move(out));
         }
         g_queueCv.notify_one();
     }
+
+    ZSTD_freeCCtx(cctx);
 }
 
-// ── Helper: actually write one CompressedItem to disk and update state.
-// Caller is the writer thread, so no locking around CameraState here.
+// ── Helper: actually write one CompressedItem to disk ─────────────
 static void writeCompressedFrame(int ci, CompressedItem& item,
                                  double totalMsArr[4], double maxMsArr[4],
                                  size_t totalBytesArr[4], int writeCountArr[4])
@@ -241,7 +264,7 @@ static void writeCompressedFrame(int ci, CompressedItem& item,
     cam.nextExpectedFrameIdx++;
 }
 
-// ── Single writer thread — handles reorder + chunk rotation ────────
+// ── Single writer thread — reorder + chunk rotation ────────────────
 void writerThreadFunc()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -270,8 +293,6 @@ void writerThreadFunc()
 
         if (item.frameIndex == cam.nextExpectedFrameIdx)
         {
-            // In-order arrival — write it, then drain consecutive frames
-            // that were waiting in the reorder buffer.
             writeCompressedFrame(ci, item,
                                  totalWriteMs, maxWriteMs, totalBytes, writeCount);
 
@@ -286,20 +307,18 @@ void writerThreadFunc()
         }
         else if (item.frameIndex > cam.nextExpectedFrameIdx)
         {
-            // Future frame — stash until its predecessors arrive.
             cam.reorderBuf.emplace(item.frameIndex, std::move(item));
         }
-        // (item.frameIndex < nextExpectedFrameIdx is impossible by design)
     }
 
-    // After stopWriter is set, drain anything still in reorder buffers.
+    // Drain any remaining in-order frames from reorder buffers
     for (int ci = 0; ci < 4; ++ci)
     {
         auto& cam = g_cameras[ci];
         while (!cam.reorderBuf.empty())
         {
             auto it = cam.reorderBuf.begin();
-            if (it->first != cam.nextExpectedFrameIdx) break;  // gap — give up
+            if (it->first != cam.nextExpectedFrameIdx) break;
             writeCompressedFrame(ci, it->second,
                                  totalWriteMs, maxWriteMs, totalBytes, writeCount);
             cam.reorderBuf.erase(it);
@@ -343,10 +362,6 @@ public:
 
         auto& cam = g_cameras[m_index];
 
-        // Try to grab a free buffer first.  If we can't, the frame is dropped
-        // BEFORE consuming a frame index — that keeps frameIndex contiguous
-        // through the pipeline so the writer's reorder logic never deadlocks
-        // waiting for a frame that doesn't exist.
         int bufIdx = -1;
         {
             std::lock_guard<std::mutex> lk(cam.freeBufsMtx);
@@ -363,10 +378,9 @@ public:
             return;
         }
 
-        // Now the frame is committed to the pipeline — assign its index.
         int count = cam.frameCount.fetch_add(1);
 
-        memcpy(cam.bufs[bufIdx], pRaw8, FRAME_BYTES);
+        std::memcpy(cam.bufs[bufIdx], pRaw8, FRAME_BYTES);
 
         {
             std::lock_guard<std::mutex> lk(cam.compressMtx);
@@ -412,15 +426,17 @@ std::string createExperimentFolder()
             g_cameras[i].freeBufs.push_back(j);
         }
 
+        // Metadata format: each chunk is [u32 size][zstd bytes] records.
+        // Decompresses back to FRAME_BYTES of raw Mono8 pixel data.
         std::ofstream meta(path + "/metadata.txt");
-        meta << "width="             << IMG_W                 << "\n"
-             << "height="            << IMG_H                 << "\n"
+        meta << "width="             << IMG_W                    << "\n"
+             << "height="            << IMG_H                    << "\n"
              << "channels=1\n"
              << "dtype=uint8\n"
-             << "format=png\n"
-             << "png_level="         << PNG_COMPRESSION_LEVEL << "\n"
-             << "frames_per_chunk="  << FRAMES_PER_CHUNK      << "\n"
-             << "fps="               << CAPTURE_FPS           << "\n"
+             << "format=zstd\n"
+             << "zstd_level="        << ZSTD_COMPRESSION_LEVEL   << "\n"
+             << "frames_per_chunk="  << FRAMES_PER_CHUNK         << "\n"
+             << "fps="               << CAPTURE_FPS              << "\n"
              << "compress_threads="  << COMPRESS_THREADS_PER_CAM << "\n";
     }
 
@@ -460,13 +476,12 @@ int main()
         std::string expPath = createExperimentFolder();
         std::cout << "Saving to: " << expPath << std::endl;
         std::cout << "Mode: " << IMG_W << "x" << IMG_H
-                  << " 8-bit mono PNG (level " << PNG_COMPRESSION_LEVEL
+                  << " 8-bit mono ZSTD (level " << ZSTD_COMPRESSION_LEVEL
                   << ") @ " << CAPTURE_FPS << " fps for " << RECORD_SECONDS
                   << " sec  (" << COMPRESS_THREADS_PER_CAM
-                  << " compress threads/cam)\n" << std::endl;
+                  << " compress threads/cam, " << (COMPRESS_THREADS_PER_CAM * 4)
+                  << " total)\n" << std::endl;
 
-        // Start writer first, then COMPRESS_THREADS_PER_CAM compression
-        // threads per camera (= 4 * 4 = 16 threads in the default config).
         g_writerThread = std::thread(writerThreadFunc);
         for (int i = 0; i < 4; ++i)
         {
@@ -584,7 +599,7 @@ int main()
                 if (t.joinable()) t.join();
         }
 
-        // Print compression stats now that all threads have finished.
+        // Print compression stats
         for (int i = 0; i < 4; ++i)
         {
             auto& cam = g_cameras[i];

@@ -1,4 +1,5 @@
 #include <opencv2/opencv.hpp>
+#include <zstd.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <numeric>
 #include <cstdint>
+#include <atomic>
 
 namespace fs = std::filesystem;
 
@@ -19,7 +21,7 @@ namespace fs = std::filesystem;
 const std::string SAVE_ROOT = "recordings";
 const int         DISPLAY_W    = 800;
 const int         DISPLAY_H    = 667;
-const double      PLAYBACK_FPS = 30.0;   // hardcoded: real-time speed for 30 fps captures
+const double      FALLBACK_FPS = 30.0;   // used if metadata has no fps field
 const int         IMG_W        = 2600;
 const int         IMG_H     = 2160;
 const size_t      FRAME_BYTES = (size_t)IMG_W * IMG_H;
@@ -155,6 +157,37 @@ cv::Mat loadFramePng(const std::string& camFolder, const FrameLoc& loc)
     if (!f) return {};
 
     return cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
+}
+
+// ── Load a single Zstd-compressed frame from its chunk ────────────
+// Each record is [u32 size][zstd bytes].  The decompressed payload is
+// exactly FRAME_BYTES of raw Mono8 pixel data.
+cv::Mat loadFrameZstd(const std::string& camFolder, const FrameLoc& loc,
+                      ZSTD_DCtx* dctx)
+{
+    std::string path = (loc.chunkIndex < 0)
+        ? camFolder + "/frames.bin"
+        : chunkFilename(camFolder, loc.chunkIndex);
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return {};
+
+    f.seekg((std::streamoff)loc.byteOffset);
+    uint32_t size = 0;
+    f.read(reinterpret_cast<char*>(&size), sizeof(size));
+    if (!f || size == 0) return {};
+
+    std::vector<uint8_t> compressed(size);
+    f.read(reinterpret_cast<char*>(compressed.data()), size);
+    if (!f) return {};
+
+    cv::Mat gray(IMG_H, IMG_W, CV_8UC1);
+    size_t out = ZSTD_decompressDCtx(dctx,
+        gray.data, FRAME_BYTES,
+        compressed.data(), size);
+    if (ZSTD_isError(out) || out != FRAME_BYTES) return {};
+
+    return gray;
 }
 
 // ── Load a single raw frame (legacy single-file format) ─────────
@@ -365,8 +398,9 @@ int main()
     {
         metas[i] = loadMeta(camFolders[i]);
 
-        if (metas[i].format == "png")
+        if (metas[i].format == "png" || metas[i].format == "zstd")
         {
+            // Both formats use [u32 size][bytes] chunked layout — same scanner.
             pngOffsets[i] = buildPngOffsets(camFolders[i]);
             frameCounts[i] = (int)pngOffsets[i].size();
         }
@@ -417,6 +451,9 @@ int main()
     for (int t = 0; t < N_DECODE_THREADS; ++t)
     {
         decoders.emplace_back([&]() {
+            // Per-thread Zstd decompression context — reused across frames.
+            ZSTD_DCtx* dctx = ZSTD_createDCtx();
+
             while (true)
             {
                 int idx = nextWork.fetch_add(1);
@@ -431,13 +468,15 @@ int main()
                 }
 
                 cv::Mat full;
-                if (metas[cam].format == "png" && frame < (int)pngOffsets[cam].size())
+                if (metas[cam].format == "zstd" && frame < (int)pngOffsets[cam].size())
+                    full = loadFrameZstd(camFolders[cam], pngOffsets[cam][frame], dctx);
+                else if (metas[cam].format == "png" && frame < (int)pngOffsets[cam].size())
                     full = loadFramePng(camFolders[cam], pngOffsets[cam][frame]);
                 else if (metas[cam].format == "raw" && metas[cam].framesPerChunk > 0)
                     full = loadFrameRawChunked(camFolders[cam], frame,
                                                metas[cam].frameStride,
                                                metas[cam].framesPerChunk);
-                else if (metas[cam].format != "png")
+                else if (metas[cam].format != "png" && metas[cam].format != "zstd")
                     full = loadFrameRaw(camFolders[cam], frame, metas[cam].frameStride);
 
                 if (!full.empty())
@@ -455,6 +494,8 @@ int main()
                               << std::flush;
                 }
             }
+
+            ZSTD_freeDCtx(dctx);
         });
     }
 
@@ -466,7 +507,14 @@ int main()
               << std::fixed << std::setprecision(2) << decodeSec << " sec  ("
               << (int)(totalWork / decodeSec) << " fps decode rate)" << std::endl;
 
-    std::cout << "\nPlayback at " << PLAYBACK_FPS
+    // Pick the highest fps reported by any camera's metadata; fall back if
+    // none of them recorded an fps value.
+    double playbackFps = 0.0;
+    for (int i = 0; i < 4; ++i)
+        if (metas[i].fps > playbackFps) playbackFps = metas[i].fps;
+    if (playbackFps <= 0.0) playbackFps = FALLBACK_FPS;
+
+    std::cout << "\nPlayback at " << playbackFps
               << " fps (real-time, every frame shown)" << std::endl;
     std::cout << "Controls: SPACE = pause/resume | Q = quit\n" << std::endl;
 
@@ -477,7 +525,7 @@ int main()
 
     int  frameIdx      = 0;
     auto frameDuration = std::chrono::microseconds(
-        (long long)(1000000.0 / PLAYBACK_FPS));
+        (long long)(1000000.0 / playbackFps));
 
     while (true)
     {
